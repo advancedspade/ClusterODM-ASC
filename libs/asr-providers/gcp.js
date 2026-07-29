@@ -217,7 +217,7 @@ module.exports = class GCPAsrProvider extends AbstractASRProvider{
         const base = this._resolvedWebhookBase || this.getConfig("webhookBaseUrl");
         if (!base) throw new Error("webhookBaseUrl is not resolved");
         const url = new URL("/commit", base.endsWith("/") ? base : base + "/");
-        if (token) url.search = `token=${token}`;
+        if (token) url.search = new URLSearchParams({token}).toString();
         return url.toString();
     }
 

@@ -53,6 +53,17 @@ module.exports = {
         return uuidv4();
     },
 
+    // Object storage key for a task asset. Deliberately avoids path.join,
+    // which collapses ".." and would let a download request escape the
+    // taskId prefix and read unrelated objects in the bucket.
+    // Returns null when assetPath carries no usable segments.
+    storageObjectKey: function(taskId, assetPath){
+        const segments = String(assetPath || "").split('/')
+                .filter(s => s.length > 0 && s !== '.' && s !== '..');
+        if (!segments.length) return null;
+        return [taskId].concat(segments).join('/');
+    },
+
     shuffleArray: function(array) {
         for (let i = array.length - 1; i > 0; i--) {
             const j = Math.floor(Math.random() * (i + 1));

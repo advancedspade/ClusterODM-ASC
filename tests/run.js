@@ -80,6 +80,10 @@ async function testGcpProvider(){
         provider.workerWebhookUrl("oauth-owner"),
         "http://10.0.0.5:3000/commit?token=oauth-owner"
     );
+    assert.strictEqual(
+        provider.workerWebhookUrl("a&b=c d"),
+        "http://10.0.0.5:3000/commit?token=a%26b%3Dc+d"
+    );
 
     const args = await provider.getCreateArgs(700, 1);
     assert.ok(args.indexOf("--no-address") !== -1);
@@ -119,6 +123,33 @@ async function testGcpProvider(){
     assert.strictEqual(client.project, "tools-dev");
 }
 
+async function testStorageObjectKey(){
+    const utils = require("../libs/utils");
+    const taskId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    assert.strictEqual(utils.storageObjectKey(taskId, "all.zip"), `${taskId}/all.zip`);
+    assert.strictEqual(
+        utils.storageObjectKey(taskId, "odm_orthophoto/odm_orthophoto.tif"),
+        `${taskId}/odm_orthophoto/odm_orthophoto.tif`
+    );
+
+    // Traversal must stay inside the task prefix.
+    [
+        "../other-task/all.zip",
+        "..//other-task/all.zip",
+        "foo/../../other-task/all.zip",
+        "./../outputs/secret.tif"
+    ].forEach(assetPath => {
+        const key = utils.storageObjectKey(taskId, assetPath);
+        assert.ok(key.startsWith(`${taskId}/`), `${assetPath} escaped the task prefix: ${key}`);
+        assert.strictEqual(key.indexOf(".."), -1);
+    });
+
+    assert.strictEqual(utils.storageObjectKey(taskId, ".."), null);
+    assert.strictEqual(utils.storageObjectKey(taskId, "/"), null);
+    assert.strictEqual(utils.storageObjectKey(taskId, ""), null);
+}
+
 async function testReferenceNodeTokenRotation(){
     const node = new Node("reference-node", 3000, "old-token");
     node.setToken("new-token");
@@ -131,6 +162,7 @@ async function testReferenceNodeTokenRotation(){
     await testRoutes();
     await testAscOAuth();
     await testGcpProvider();
+    await testStorageObjectKey();
     await testReferenceNodeTokenRotation();
     console.log("All tests passed");
 })().catch(err => {

@@ -587,7 +587,13 @@ module.exports = {
                                 const provider = asrProvider.get();
                                 const gcsConfig = provider.getConfig("gcs");
                                 const s3Config = provider.getConfig("s3");
-                                const key = path.join(taskId, assetPath);
+
+                                const key = utils.storageObjectKey(taskId, assetPath);
+                                if (!key){
+                                    res.statusCode = 400;
+                                    res.end('Bad request');
+                                    return;
+                                }
 
                                 // GCP ASR: stream via ADC (no HMAC / SA keys).
                                 if (gcsConfig && gcsConfig.bucket && provider.getDriverName && provider.getDriverName() === "gce"){
@@ -615,8 +621,16 @@ module.exports = {
                                         .catch(err => {
                                             logger.error(`GCS download metadata failed: ${err}`);
                                             if (!res.headersSent){
-                                                res.statusCode = 404;
-                                                res.end('Not found');
+                                                // Only a real missing object is a 404; auth and
+                                                // transport failures must not masquerade as one.
+                                                const status = Number(err && err.code);
+                                                if (status === 404){
+                                                    res.statusCode = 404;
+                                                    res.end('Not found');
+                                                }else{
+                                                    res.statusCode = 500;
+                                                    res.end('Internal server error');
+                                                }
                                             }
                                         });
                                     return;
