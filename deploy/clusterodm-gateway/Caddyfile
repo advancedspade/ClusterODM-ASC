@@ -1,0 +1,25 @@
+{
+	# Keep the admin API inside the container.
+	admin localhost:2019
+}
+
+{$GATEWAY_HOSTNAME} {
+	encode zstd gzip
+
+	reverse_proxy clusterodm:3000 {
+		# NodeODM uploads and long-running task/status requests must not inherit
+		# a short proxy response timeout.
+		transport http {
+			dial_timeout 10s
+			response_header_timeout 0s
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+
+	log
+}

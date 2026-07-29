@@ -34,6 +34,19 @@ const routetable = require('./libs/routetable');
     const cloudProvider = (require('./libs/cloudProvider')).initialize(config.cloud_provider);
     await (require('./libs/asrProvider')).initialize(config.asr);
     await nodes.initialize();
+
+    const referenceHost = process.env.REFERENCE_NODE_HOST || "";
+    if (referenceHost){
+        const referencePort = parseInt(process.env.REFERENCE_NODE_PORT || "3000");
+        const referenceToken = process.env.REFERENCE_NODE_TOKEN || "";
+        const referenceNode = nodes.ensureLockedReference(referenceHost, referencePort, referenceToken);
+        if (!referenceNode){
+            throw new Error("Cannot configure locked reference node from environment");
+        }
+        await referenceNode.updateInfo();
+        logger.info(`Configured locked reference node: ${referenceNode}`);
+    }
+
     floodMonitor.initialize();
 
     const proxies = await proxy.initialize(cloudProvider);

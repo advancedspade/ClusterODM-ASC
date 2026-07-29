@@ -35,7 +35,8 @@ let argDefs = {
     string: ['port', 'admin-cli-port', 'admin-pass', 'admin-web-port',
             'cloud-provider', 'downloads-from-s3', 'token', 'log-level',
             'upload-max-speed', 'ssl-key', 'ssl-cert', 'secure-port',
-            'public-address', 'config',
+            'public-address', 'config', 'session-secret', 'oauth-cookie-name',
+            'oauth-allowed-domains',
             'asr'],
     boolean: ['splitmerge', 'debug'],
     alias: {
@@ -69,6 +70,9 @@ Options:
     --flood-limit <number>	Limit the number of simultaneous task uploads that a user can initiate concurrently (default: no limit)
     --stale-uploads-timeout <number>	Delete temporary uploads if no activity is recorded for these many hours. After 48 hours stale uploads are always removed regardless of this option. (default: do not remove stale uploads)
     --token <token> Sets a token that needs to be passed for every request. This can be used to limit access to the node only to token holders. (default: none)
+    --session-secret <secret> Shared HS256 secret used by NodeODM-ASC OAuth sessions (required with --cloud-provider ascOAuth)
+    --oauth-cookie-name <name> NodeODM-ASC OAuth cookie name (default: ndm_oauth)
+    --oauth-allowed-domains <domains> Comma-separated Google Workspace domains accepted by ascOAuth
     --debug 	Disable caches and other settings to facilitate debug (default: false)
     --ssl-key <file>	Path to .pem SSL key file
     --ssl-cert <file>	Path to SSL .pem certificate
@@ -117,6 +121,10 @@ for (let k in argv){
     if (argDefs.int.indexOf(k) !== -1) cast = parseInt;
     if (argDefs.boolean.indexOf(k) !== -1) cast = Boolean;
     config[ck] = readConfig(k, cast);
+}
+
+if (process.env.CLUSTERODM_ADMIN_PASSWORD){
+    config.admin_pass = process.env.CLUSTERODM_ADMIN_PASSWORD;
 }
 
 config.use_ssl = config.ssl_key && config.ssl_cert;

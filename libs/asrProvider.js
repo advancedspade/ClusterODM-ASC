@@ -37,7 +37,9 @@ module.exports = {
             if (provider){
                 asrProvider = new (require('./asr-providers/' + provider + '.js'))(userConfig);
                 await asrProvider.initialize();
-                await DockerMachine.checkInstalled();
+                if (asrProvider.requiresDockerMachine()){
+                    await DockerMachine.checkInstalled();
+                }
             }else{
                 throw new Error("Your ASR configuration must specify a provider key (we didn't find it).");
             }

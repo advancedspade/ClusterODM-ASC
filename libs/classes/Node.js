@@ -184,6 +184,10 @@ module.exports = class Node{
         return this.nodeData.token;
     }
 
+    setToken(token){
+        this.nodeData.token = token || "";
+    }
+
     async getOptions(){
         try{
             let response = await axios.get(this.urlFor('/options'),  { timeout: this.timeout });

@@ -39,6 +39,8 @@ const asrProvider = require('./asrProvider');
 const floodMonitor = require('./floodMonitor');
 const concurrencyMonitor = require('./concurrencyMonitor');
 const AWS = require('aws-sdk');
+const {Storage} = require('@google-cloud/storage');
+const ascUiRoutes = require('./ascUiRoutes');
 
 module.exports = {
     initialize: async function(cloudProvider){
@@ -71,6 +73,7 @@ module.exports = {
 
         // JSON helper for responses
         const json = utils.json;
+        const ascUiEnabled = String(config.cloud_provider || "").toLowerCase() === "ascoauth";
 
         const forwardToReferenceNode = (req, res) => {
             const referenceNode = nodes.referenceNode();
@@ -78,6 +81,19 @@ module.exports = {
                 proxy.web(req, res, { target: referenceNode.proxyTargetUrl() });
             }else{
                 json(res, {error: "No nodes available"});
+            }
+        };
+
+        const forwardToUiReferenceNode = (req, res) => {
+            const referenceNode = nodes.uiReferenceNode();
+            if (referenceNode){
+                proxy.web(req, res, {
+                    target: referenceNode.proxyTargetUrl(),
+                    xfwd: true
+                });
+            }else{
+                res.writeHead(503, {"Content-Type": "application/json"});
+                res.end(JSON.stringify({error: "The locked NodeODM-ASC UI reference node is unavailable"}));
             }
         };
 
@@ -205,6 +221,14 @@ module.exports = {
             try{
                 const urlParts = url.parse(req.url, true);
                 const { query, pathname } = urlParts;
+
+                // NodeODM-ASC owns the public UI and OAuth endpoints. Keep these
+                // ahead of ClusterODM's auth gate so unsigned users can reach
+                // login and Google can reach the OAuth callback.
+                if (ascUiEnabled && ascUiRoutes.isPublicUiPath(pathname)){
+                    forwardToUiReferenceNode(req, res);
+                    return;
+                }
                 
                 if (publicPath(pathname)){
                     forwardToReferenceNode(req, res);
@@ -250,11 +274,22 @@ module.exports = {
                 }
 
                 // Validate user token
-                const { valid, limits } = await cloudProvider.validate(query.token);
+                const validation = await cloudProvider.validate(query.token, req);
+                const valid = validation && validation.valid;
+                const limits = (validation && validation.limits) || {};
+                const userToken = (validation && validation.token) || query.token;
+                req.clusterAuthToken = (validation && validation.accessToken) || query.token;
                 if (!valid || query._debugUnauthorized){
                     // json(res, {error: "Invalid authentication token"});
                     res.writeHead(401, "unauthorized");
                     res.end();
+                    return;
+                }
+
+                // These custom APIs stay on the locked NodeODM-ASC reference
+                // node, but only after the OAuth cookie/JWT has been verified.
+                if (ascUiEnabled && ascUiRoutes.isProtectedReferencePath(pathname)){
+                    forwardToUiReferenceNode(req, res);
                     return;
                 }
 
@@ -264,7 +299,7 @@ module.exports = {
                 }
 
                 if (pathHandlers[pathname]){
-                    (pathHandlers[pathname])(req, res, { token: query.token, limits });
+                    (pathHandlers[pathname])(req, res, { token: userToken, limits });
                     return;
                 }
 
@@ -292,7 +327,7 @@ module.exports = {
                             return;
                         }
 
-                        if (await maxConcurrencyLimitReached(limits.maxConcurrentTasks, query.token)){
+                        if (await maxConcurrencyLimitReached(limits.maxConcurrentTasks, userToken)){
                             // TODO: A better solution would be to put the task in a queue
                             // but it's non-trivial to keep such a state, as well as to deal
                             // with scalability of storage requirements.
@@ -302,15 +337,15 @@ module.exports = {
 
                         // Validate options
                         try{
-                            odmOptions.filterOptions(options, await getLimitedOptions(query.token, limits, referenceNode));
+                            odmOptions.filterOptions(options, await getLimitedOptions(userToken, limits, referenceNode));
                         }catch(e){
                             die(e.message);
                             return;
                         }
 
-                        floodMonitor.recordTaskInit(query.token);
+                        floodMonitor.recordTaskInit(userToken);
                         
-                        if (floodMonitor.isFlooding(query.token)){
+                        if (floodMonitor.isFlooding(userToken)){
                             die(`Uuh, slow down! It seems like you are sending a lot of tasks. Check that your connection is not dropping, or wait ${floodMonitor.FORGIVE_TIME} minutes and try again.`);
                             return;
                         }
@@ -383,18 +418,18 @@ module.exports = {
                             asrProvider.cleanup(taskId);
                         };
 
-                        if (concurrencyMonitor.checkCommitLimitReached(limits.maxConcurrentTasks, query.token)){
+                        if (concurrencyMonitor.checkCommitLimitReached(limits.maxConcurrentTasks, userToken)){
                             die(`Reached maximum number of concurrent tasks, please wait until other tasks have finished, then restart the task.`);
                             return;
                         }
 
-                        if (await maxConcurrencyLimitReached(limits.maxConcurrentTasks, query.token)){
+                        if (await maxConcurrencyLimitReached(limits.maxConcurrentTasks, userToken)){
                             die(`Reached maximum number of concurrent tasks. Please wait until other tasks have finished, then restart the task.`);
                             return;
                         }
 
 
-                        floodMonitor.recordTaskCommit(query.token);
+                        floodMonitor.recordTaskCommit(userToken);
                         utils.markTaskAsCommitted(taskId);
 
                         async.series([
@@ -425,7 +460,7 @@ module.exports = {
                                 body.imagesCount = files.length;
 
                                 try{
-                                    await taskNew.process(req, res, cloudProvider, taskId, body, query.token, limits, getLimitedOptions);
+                                    await taskNew.process(req, res, cloudProvider, taskId, body, userToken, limits, getLimitedOptions);
                                 }catch(e){
                                     die(e.message);
                                     return;
@@ -450,13 +485,13 @@ module.exports = {
                             return;
                         }
 
-                        if (await maxConcurrencyLimitReached(limits.maxConcurrentTasks, query.token)){
+                        if (await maxConcurrencyLimitReached(limits.maxConcurrentTasks, userToken)){
                             die(`Reached maximum number of concurrent tasks: ${limits.maxConcurrentTasks}. Please wait until other tasks have finished, then restart the task.`);
                             return;
                         }
 
                         try{
-                            await taskNew.process(req, res, cloudProvider, uuid, params, query.token, limits, getLimitedOptions);
+                            await taskNew.process(req, res, cloudProvider, uuid, params, userToken, limits, getLimitedOptions);
                         }catch(e){
                             die(e.message);
                             return;
@@ -475,7 +510,7 @@ module.exports = {
                     });
                     busboy.on('finish', async function() {
                         if (taskId){
-                            concurrencyMonitor.decreaseCount(query.token);
+                            concurrencyMonitor.decreaseCount(userToken);
 
                             let node = await routetable.lookupNode(taskId);
                             if (node){
@@ -502,7 +537,7 @@ module.exports = {
 
                                         if (pathname === '/task/cancel'){
                                             taskTableEntry.taskInfo.status.code = statusCodes.CANCELED;
-                                            await tasktable.add(taskId, taskTableEntry, query.token);
+                                            await tasktable.add(taskId, taskTableEntry, userToken);
                                         }
 
                                         json(res, { success: true });
@@ -521,12 +556,12 @@ module.exports = {
                     utils.stringToStream(body).pipe(busboy);
                 }else if (req.method === 'GET' && pathname === '/task/list') {
                     const taskIds = {};
-                    const taskTableEntries = await tasktable.findByToken(query.token);
+                    const taskTableEntries = await tasktable.findByToken(userToken);
                     for (let taskId in taskTableEntries){
                         taskIds[taskId] = true;
                     }
 
-                    const routeTableEntries = await routetable.findByToken(query.token, true);
+                    const routeTableEntries = await routetable.findByToken(userToken, true);
                     for (let taskId in routeTableEntries){
                         taskIds[taskId] = true;
                     }
@@ -539,9 +574,8 @@ module.exports = {
                         const taskId = matches[1];
                         const action = matches[2];
 
-                        // Special case for /task/<uuid>/download/<asset> if 
-                        // we need to redirect to S3. In that case, we rewrite
-                        // the URL to fetch from S3.
+                        // Post-teardown downloads: stream from object storage
+                        // when the worker VM is already gone.
                         if (asrProvider.downloadsPath() && action.indexOf('download') === 0){
                             const assetsMatch = action.match(/^download\/(.+)$/);
                             if (assetsMatch && assetsMatch[1]){
@@ -550,39 +584,72 @@ module.exports = {
                                 // Special case for orthophoto.tif
                                 if (assetPath === 'orthophoto.tif') assetPath = 'odm_orthophoto/odm_orthophoto.tif';
 
+                                const provider = asrProvider.get();
+                                const gcsConfig = provider.getConfig("gcs");
+                                const s3Config = provider.getConfig("s3");
+                                const key = path.join(taskId, assetPath);
+
+                                // GCP ASR: stream via ADC (no HMAC / SA keys).
+                                if (gcsConfig && gcsConfig.bucket && provider.getDriverName && provider.getDriverName() === "gce"){
+                                    const storage = new Storage(
+                                        gcsConfig.projectId ? {projectId: gcsConfig.projectId} : undefined
+                                    );
+                                    const file = storage.bucket(gcsConfig.bucket).file(key);
+                                    file.getMetadata()
+                                        .then(results => {
+                                            const metadata = results[0] || {};
+                                            if (metadata.contentType) res.setHeader('Content-Type', metadata.contentType);
+                                            if (metadata.size) res.setHeader('Content-Length', metadata.size);
+                                            file.createReadStream()
+                                                .on('error', err => {
+                                                    logger.error(`Error encountered downloading GCS object ${err}`);
+                                                    if (!res.headersSent){
+                                                        res.statusCode = 500;
+                                                        res.end('Internal server error');
+                                                    }else{
+                                                        res.destroy(err);
+                                                    }
+                                                })
+                                                .pipe(res);
+                                        })
+                                        .catch(err => {
+                                            logger.error(`GCS download metadata failed: ${err}`);
+                                            if (!res.headersSent){
+                                                res.statusCode = 404;
+                                                res.end('Not found');
+                                            }
+                                        });
+                                    return;
+                                }
+
                                 const s3Url = url.parse(asrProvider.downloadsPath());
-                                s3Url.pathname = path.join(taskId, assetPath);
+                                s3Url.pathname = key;
 
-                                const s3Config = asrProvider.get().getConfig("s3");
-
-                                // If URL requires authentication, fetch the object on their behalf and then stream it to them
-                                // If our aws library gets updated to v3, then we could return a redirect to a presigned url instead 
+                                // Legacy S3 ASR providers (aws/do/hetzner/scaleway).
                                 if (s3Config && s3Config.acl !== undefined && s3Config.acl !== "public-read") {
-                                    let key = path.join(taskId, assetPath)
-
                                     const s3 = new AWS.S3({
                                         endpoint: new AWS.Endpoint(s3Config.endpoint),
                                         signatureVersion: 'v4',
-                                        accessKeyId: asrProvider.get().getConfig("accessKey"),
-                                        secretAccessKey: asrProvider.get().getConfig("secretKey")
+                                        accessKeyId: provider.getConfig("accessKey"),
+                                        secretAccessKey: provider.getConfig("secretKey")
                                     });
 
-                                    s3.getObject({ Bucket: s3Config.bucket, Key: key }, (err, data) => {
-                                        if (err) {
-                                          logger.error(`Error encountered downloading object ${err}`);
-                                          res.statusCode = 500;
-                                          res.end('Internal server error');
-                                          return;
-                                        }
-
-                                        // Set the content-type and content-length headers
-                                        res.setHeader('Content-Type', data.ContentType);
-                                        res.setHeader('Content-Length', data.ContentLength);
-
-                                        // Write the object data to the response
-                                        res.write(data.Body);
-                                        res.end();
+                                    const objectRequest = s3.getObject({Bucket: s3Config.bucket, Key: key});
+                                    objectRequest.on('httpHeaders', (statusCode, headers) => {
+                                        if (headers['content-type']) res.setHeader('Content-Type', headers['content-type']);
+                                        if (headers['content-length']) res.setHeader('Content-Length', headers['content-length']);
                                     });
+                                    objectRequest.createReadStream()
+                                        .on('error', err => {
+                                            logger.error(`Error encountered downloading object ${err}`);
+                                            if (!res.headersSent){
+                                                res.statusCode = 500;
+                                                res.end('Internal server error');
+                                            }else{
+                                                res.destroy(err);
+                                            }
+                                        })
+                                        .pipe(res);
                                     return;
 
                                 } else {

@@ -1,0 +1,209 @@
+name: Deploy ClusterODM Gateway (dev)
+
+# Owns the gateway Compose stack end-to-end:
+#   1) build/push clusterodm-asc to asc-shared-services-dev Artifact Registry
+#   2) sync deploy/clusterodm-gateway to the gateway VM and restart Compose
+#
+# Legacy NodeODM staging/prod/super workflows are untouched (still gcr.io)
+# until cutover removes them. NodeODM-ASC has a separate workflow that only
+# refreshes the nodeodm-asc image used by the reference node / workers.
+#
+# GitHub Environment: dev
+# Required secrets: SESSION_SECRET, OAUTH_GOOGLE_CLIENT_ID,
+#   OAUTH_GOOGLE_CLIENT_SECRET, REFERENCE_NODE_TOKEN, CLUSTERODM_ADMIN_PASSWORD
+# Optional vars: GATEWAY_HOSTNAME, OAUTH_ALLOWED_DOMAINS, PORTAL_SUPER_ENV_URL
+# ASR config (deploy/clusterodm-gateway/gcp-asr.json) is committed — no HMAC.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - dev
+
+env:
+  GCP_PROJECT_ID: asc-internal-tools-dev
+  GCE_ZONE: us-central1-a
+  GATEWAY_INSTANCE: clusterodm-gateway-dev
+  AR_PROJECT_ID: asc-shared-services-dev
+  AR_LOCATION: us-central1
+  AR_REPOSITORY: containers
+  CLUSTERODM_IMAGE_NAME: clusterodm-asc
+  NODEODM_IMAGE_NAME: nodeodm-asc
+  IMAGE_TAG: dev
+  WIF_PROVIDER: projects/809964514017/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
+  SA_EMAIL: clusterodm-deployer@asc-internal-tools-dev.iam.gserviceaccount.com
+  GATEWAY_HOSTNAME_DEFAULT: dev.drone.advancedspadecompany.com
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build-and-push:
+    name: Build and Push clusterodm-asc
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.SA_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.AR_LOCATION }}-docker.pkg.dev --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.AR_LOCATION }}-docker.pkg.dev/${{ env.AR_PROJECT_ID }}/${{ env.AR_REPOSITORY }}/${{ env.CLUSTERODM_IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.AR_LOCATION }}-docker.pkg.dev/${{ env.AR_PROJECT_ID }}/${{ env.AR_REPOSITORY }}/${{ env.CLUSTERODM_IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-gateway:
+    name: Deploy Compose stack to gateway VM
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.SA_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      - name: Verify NodeODM image exists in Artifact Registry
+        run: |
+          set -euo pipefail
+          IMAGE="${AR_LOCATION}-docker.pkg.dev/${AR_PROJECT_ID}/${AR_REPOSITORY}/${NODEODM_IMAGE_NAME}:${IMAGE_TAG}"
+          if ! gcloud artifacts docker images describe "${IMAGE}" --project="${AR_PROJECT_ID}" >/dev/null 2>&1; then
+            echo "Missing ${IMAGE}"
+            echo "Publish it first via NodeODM-ASC workflow publish-ar-nodeodm-dev.yml"
+            exit 1
+          fi
+          echo "Found ${IMAGE}"
+
+      - name: Prepare runtime files
+        env:
+          GATEWAY_HOSTNAME: ${{ vars.GATEWAY_HOSTNAME }}
+          SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
+          OAUTH_GOOGLE_CLIENT_ID: ${{ secrets.OAUTH_GOOGLE_CLIENT_ID }}
+          OAUTH_GOOGLE_CLIENT_SECRET: ${{ secrets.OAUTH_GOOGLE_CLIENT_SECRET }}
+          OAUTH_ALLOWED_DOMAINS: ${{ vars.OAUTH_ALLOWED_DOMAINS }}
+          REFERENCE_NODE_TOKEN: ${{ secrets.REFERENCE_NODE_TOKEN }}
+          CLUSTERODM_ADMIN_PASSWORD: ${{ secrets.CLUSTERODM_ADMIN_PASSWORD }}
+          PORTAL_SUPER_ENV_URL: ${{ vars.PORTAL_SUPER_ENV_URL }}
+        run: |
+          set -euo pipefail
+          GATEWAY_HOSTNAME="${GATEWAY_HOSTNAME:-${GATEWAY_HOSTNAME_DEFAULT}}"
+          OAUTH_ALLOWED_DOMAINS="${OAUTH_ALLOWED_DOMAINS:-advancedspadecompany.com}"
+          PORTAL_SUPER_ENV_URL="${PORTAL_SUPER_ENV_URL:-https://superdrone.advancedspadecompany.com}"
+
+          : "${SESSION_SECRET:?SESSION_SECRET is required}"
+          : "${OAUTH_GOOGLE_CLIENT_ID:?OAUTH_GOOGLE_CLIENT_ID is required}"
+          : "${OAUTH_GOOGLE_CLIENT_SECRET:?OAUTH_GOOGLE_CLIENT_SECRET is required}"
+          : "${REFERENCE_NODE_TOKEN:?REFERENCE_NODE_TOKEN is required}"
+          : "${CLUSTERODM_ADMIN_PASSWORD:?CLUSTERODM_ADMIN_PASSWORD is required}"
+
+          mkdir -p /tmp/clusterodm-gateway-deploy
+          cp -a deploy/clusterodm-gateway/. /tmp/clusterodm-gateway-deploy/
+          cd /tmp/clusterodm-gateway-deploy
+
+          if [[ ! -f gcp-asr.json ]]; then
+            echo "Missing deploy/clusterodm-gateway/gcp-asr.json" >&2
+            exit 1
+          fi
+
+          NODEODM_IMAGE="${AR_LOCATION}-docker.pkg.dev/${AR_PROJECT_ID}/${AR_REPOSITORY}/${NODEODM_IMAGE_NAME}:${IMAGE_TAG}"
+          CLUSTERODM_IMAGE="${AR_LOCATION}-docker.pkg.dev/${AR_PROJECT_ID}/${AR_REPOSITORY}/${CLUSTERODM_IMAGE_NAME}:${IMAGE_TAG}"
+
+          # GATEWAY_INTERNAL_IP is filled on the VM by remote-deploy.sh
+          cat > .env <<EOF
+          GCP_PROJECT_ID=${GCP_PROJECT_ID}
+          GATEWAY_HOSTNAME=${GATEWAY_HOSTNAME}
+          GATEWAY_INTERNAL_IP=
+          CLUSTERODM_IMAGE=${CLUSTERODM_IMAGE}
+          NODEODM_IMAGE=${NODEODM_IMAGE}
+          ASR_CONFIG_PATH=/run/secrets/gcp-asr.json
+          SESSION_SECRET=${SESSION_SECRET}
+          REFERENCE_NODE_TOKEN=${REFERENCE_NODE_TOKEN}
+          CLUSTERODM_ADMIN_PASSWORD=${CLUSTERODM_ADMIN_PASSWORD}
+          OAUTH_GOOGLE_CLIENT_ID=${OAUTH_GOOGLE_CLIENT_ID}
+          OAUTH_GOOGLE_CLIENT_SECRET=${OAUTH_GOOGLE_CLIENT_SECRET}
+          OAUTH_ALLOWED_DOMAINS=${OAUTH_ALLOWED_DOMAINS}
+          OAUTH_SESSION_DAYS=30
+          PORTAL_STAGING_ENV_LABEL=cluster dev
+          PORTAL_STAGING_ENV_TAGLINE=On-demand processing
+          PORTAL_SUPER_ENV_URL=${PORTAL_SUPER_ENV_URL}
+          PORTAL_SUPER_ENV_LABEL=superdrone
+          PORTAL_SUPER_ENV_TAGLINE=Current production
+          EOF
+          sed -i 's/^[[:space:]]*//' .env
+          chmod 600 .env
+
+      - name: Upload stack to gateway and deploy
+        run: |
+          set -euo pipefail
+          SSH=(gcloud compute ssh "${GATEWAY_INSTANCE}"
+            --zone="${GCE_ZONE}"
+            --project="${GCP_PROJECT_ID}"
+            --tunnel-through-iap
+            --quiet)
+
+          "${SSH[@]}" --command='sudo mkdir -p /opt/clusterodm /var/lib/clusterodm/secrets && sudo chown -R "$(id -un):$(id -gn)" /opt/clusterodm'
+
+          tar -C /tmp/clusterodm-gateway-deploy -czf /tmp/clusterodm-gateway-deploy.tgz .
+          "${SSH[@]}" --command='tar -C /opt/clusterodm -xzf -' < /tmp/clusterodm-gateway-deploy.tgz
+
+          "${SSH[@]}" --command="chmod +x /opt/clusterodm/scripts/*.sh && sudo /opt/clusterodm/scripts/remote-deploy.sh"
+
+      - name: External health check
+        env:
+          GATEWAY_HOSTNAME: ${{ vars.GATEWAY_HOSTNAME }}
+        run: |
+          set -euo pipefail
+          GATEWAY_HOSTNAME="${GATEWAY_HOSTNAME:-${GATEWAY_HOSTNAME_DEFAULT}}"
+          VM_IP=$(gcloud compute instances describe "${GATEWAY_INSTANCE}" \
+            --zone="${GCE_ZONE}" \
+            --project="${GCP_PROJECT_ID}" \
+            --format='get(networkInterfaces[0].accessConfigs[0].natIP)')
+          echo "Checking http://${VM_IP}/login.html (Host: ${GATEWAY_HOSTNAME})"
+          ok=0
+          for i in 1 2 3 4 5 6 7 8; do
+            if curl -fsS -H "Host: ${GATEWAY_HOSTNAME}" "http://${VM_IP}/login.html" >/dev/null; then
+              ok=1
+              break
+            fi
+            echo "Attempt ${i} failed, retrying..."
+            sleep 10
+          done
+          if [[ "${ok}" != "1" ]]; then
+            echo "Gateway health check failed"
+            exit 1
+          fi
+          echo "Gateway healthy"

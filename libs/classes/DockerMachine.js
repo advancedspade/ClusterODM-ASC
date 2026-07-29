@@ -44,15 +44,22 @@ module.exports = {
             this.machineName = machineName;
         }
 
-        async run(args){
-            logger.debug("Running: docker-machine " + args.join(" "));
+        async run(args, options = {}){
+            if (options.sensitive) logger.debug("Running sensitive docker-machine command (arguments redacted)");
+            else logger.debug("Running: docker-machine " + args.join(" "));
 
             return new Promise((resolve, reject) => {
                 const childProcess = spawn("docker-machine", args);
+                const timeoutMs = parseInt(process.env.DOCKER_MACHINE_TIMEOUT_MS, 10) || 30 * 60 * 1000;
                 runningProcesses[this.machineName] = runningProcesses[this.machineName] || [];
                 runningProcesses[this.machineName].push(childProcess);
+                const timeout = setTimeout(() => {
+                    logger.error(`docker-machine command timed out after ${timeoutMs}ms`);
+                    kill(childProcess.pid, 'SIGKILL', () => {});
+                }, timeoutMs);
 
                 const cleanup = () => {
+                    clearTimeout(timeout);
                     runningProcesses[this.machineName] = runningProcesses[this.machineName].filter(p => p !== childProcess);
                     if (runningProcesses[this.machineName].length === 0) delete(runningProcesses[this.machineName]);
                 };
@@ -94,8 +101,8 @@ module.exports = {
             }
         }
 
-        async ssh(command){
-            return this.run(['ssh', this.machineName, command]);
+        async ssh(command, sensitive = false){
+            return this.run(['ssh', this.machineName, command], {sensitive});
         }
 
         async getIP(){
