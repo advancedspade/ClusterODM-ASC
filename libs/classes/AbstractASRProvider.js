@@ -46,6 +46,14 @@ module.exports = class AbstractASRProvider{
         throw new Error("Not implemented");
     }
 
+    requiresDockerMachine(){
+        return true;
+    }
+
+    createMachineClient(hostname){
+        return new DockerMachine(hostname);
+    }
+
     async getCreateArgs(imagesCount, attempt){
         throw new Error("Not implemented");
     }
@@ -71,7 +79,7 @@ module.exports = class AbstractASRProvider{
     }
 
     getCreateRetries(){
-        1;
+        return 1;
     }
 
     getMaxRuntime(){
@@ -80,6 +88,14 @@ module.exports = class AbstractASRProvider{
 
     getMaxUploadTime(){
         return -1;
+    }
+
+    getNodeOnlineAttempts(){
+        return 5;
+    }
+
+    getNodeOnlineSleepMs(attempt){
+        return 1000 * attempt;
     }
 
     getNodesPendingCreation(){
@@ -95,7 +111,7 @@ module.exports = class AbstractASRProvider{
     // Setup docker machine after creation
     // @param req {http.ClientRequest} request object from HttpProxy
     // @param token {String} user token
-    // @param dm {DockerMachine} docker machine client
+    // @param dm {DockerMachine|GceMachine} machine client
     // @param nodeToken {String} token to set to protect the new machine instance services
     async setupMachine(req, token, dm, nodeToken){
         // Override
@@ -117,8 +133,9 @@ module.exports = class AbstractASRProvider{
     async createNode(req, imagesCount, token, hostname, status){
         if (!this.canHandle(imagesCount)) throw new Error(`Cannot handle ${imagesCount} images.`);
 
-        const dm = new DockerMachine(hostname);
+        const dm = this.createMachineClient(hostname);
         const nodeToken = short.generate();
+        const useInstanceSpec = typeof this.getInstanceSpec === "function";
 
         try{
             this.nodesPendingCreation++;
@@ -127,18 +144,23 @@ module.exports = class AbstractASRProvider{
             for (let i = 1; i <= this.getCreateRetries(); i++){
                 if (status.aborted) throw new Error("Aborted");
 
-                const args = ["--driver", this.getDriverName()]
-                        .concat(await this.getCreateArgs(imagesCount, i));
-
                 logger.info(`Trying to create machine... (${i})`);
                 try{
-                    await dm.create(args);
+                    if (useInstanceSpec){
+                        const spec = await this.getInstanceSpec(imagesCount, i, hostname, req, token, nodeToken);
+                        if (spec.zone && dm._zone !== undefined) dm._zone = spec.zone;
+                        await dm.create(spec);
+                    }else{
+                        const args = ["--driver", this.getDriverName()]
+                                .concat(await this.getCreateArgs(imagesCount, i));
+                        await dm.create(args);
+                    }
                     created = true;
                     break;
                 }catch(e){
-                    logger.warn(`Cannot create machine: ${e} with args ${args.join(" ")}`);
+                    logger.warn(`Cannot create machine: ${e} (attempt ${i})`);
                     try{
-                        await dm.rm(true); // Make sure to cleanup if something goes wrong!
+                        await dm.rm(true);
                     }catch(e){
                         // Do nothing
                     }
@@ -153,13 +175,13 @@ module.exports = class AbstractASRProvider{
             
             const node = new Node(await dm.getIP(), this.getServicePort(), nodeToken);
     
-            // Wait for the node to get online
-            for (let i = 1; i <= 5; i++){
+            const attempts = this.getNodeOnlineAttempts();
+            for (let i = 1; i <= attempts; i++){
                 if (status.aborted) throw new Error("Aborted");
                 await node.updateInfo();
                 if (node.isOnline()) break;
-                logger.info(`Waiting for ${node} to get online... (${i})`);
-                await utils.sleep(1000 * i);
+                logger.info(`Waiting for ${node} to get online... (${i}/${attempts})`);
+                await utils.sleep(this.getNodeOnlineSleepMs(i));
             }
             if (!node.isOnline()) throw new Error("No nodes available (spawned a new node, but the node did not get online).");
     
@@ -167,9 +189,9 @@ module.exports = class AbstractASRProvider{
             return node;
         }catch(e){
             try{
-                await dm.rm(); // Make sure to cleanup if something goes wrong!
+                await dm.rm(true);
             }catch(e){
-                logger.warn("Could not remove docker-machine, it's likely that the machine was not created, but double-check!");
+                logger.warn("Could not remove machine, it's likely that the machine was not created, but double-check!");
             }
             throw e;
         }finally{
@@ -189,7 +211,7 @@ module.exports = class AbstractASRProvider{
     
     async destroyMachine(dmHostname){
         logger.debug(`About to destroy ${dmHostname}`);
-        const dm = new DockerMachine(dmHostname);
+        const dm = this.createMachineClient(dmHostname);
         return dm.rm(true);
     }
 

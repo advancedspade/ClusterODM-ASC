@@ -221,7 +221,10 @@ module.exports = {
             // We automatically set the "sm-cluster" parameter
             // to match the address that was used to reach ClusterODM.
             // if "--split" is set.
-            const clusterUrl = netutils.publicAddressPath('/', req, token);
+            // OAuth users are keyed by a stable hashed owner token in routing
+            // tables. Split/merge workers need a real, short-lived credential
+            // to call back into ClusterODM instead.
+            const clusterUrl = netutils.publicAddressPath('/', req, req.clusterAuthToken || token);
 
             let foundSplit = false, foundSMCluster = false;
             taskOptions.forEach(to => {

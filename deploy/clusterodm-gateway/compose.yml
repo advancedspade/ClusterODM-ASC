@@ -1,0 +1,147 @@
+name: clusterodm-gateway
+
+services:
+  reference-node:
+    image: ${NODEODM_IMAGE:?Set NODEODM_IMAGE}
+    container_name: clusterodm-reference-node
+    restart: unless-stopped
+    command:
+      - -q
+      - "1"
+      - --cleanup_tasks_after
+      - "60"
+      - --cleanup_uploads_after
+      - "1440"
+    environment:
+      NODE_ENV: production
+      TRUST_PROXY: "1"
+      OAUTH_COOKIE_SECURE: "1"
+      OAUTH_GOOGLE_CLIENT_ID: ${OAUTH_GOOGLE_CLIENT_ID:?Set OAUTH_GOOGLE_CLIENT_ID}
+      OAUTH_GOOGLE_CLIENT_SECRET: ${OAUTH_GOOGLE_CLIENT_SECRET:?Set OAUTH_GOOGLE_CLIENT_SECRET}
+      OAUTH_GOOGLE_REDIRECT_URI: https://${GATEWAY_HOSTNAME:?Set GATEWAY_HOSTNAME}/auth/google/callback
+      OAUTH_ALLOWED_DOMAINS: ${OAUTH_ALLOWED_DOMAINS:-}
+      OAUTH_SESSION_DAYS: ${OAUTH_SESSION_DAYS:-30}
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET}
+      NODEODM_TOKEN: ${REFERENCE_NODE_TOKEN}
+      PORTAL_STAGING_ENV_URL: https://${GATEWAY_HOSTNAME}
+      PORTAL_STAGING_ENV_LABEL: ${PORTAL_STAGING_ENV_LABEL:-cluster dev}
+      PORTAL_STAGING_ENV_TAGLINE: ${PORTAL_STAGING_ENV_TAGLINE:-On-demand processing}
+      PORTAL_SUPER_ENV_URL: ${PORTAL_SUPER_ENV_URL:-}
+      PORTAL_SUPER_ENV_LABEL: ${PORTAL_SUPER_ENV_LABEL:-superdrone}
+      PORTAL_SUPER_ENV_TAGLINE: ${PORTAL_SUPER_ENV_TAGLINE:-Current production}
+    expose:
+      - "3000"
+    volumes:
+      - /var/lib/clusterodm/reference-data:/var/www/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl -fsS "http://localhost:3000/info?token=$${NODEODM_TOKEN}" >/dev/null
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    mem_limit: 2g
+    pids_limit: 1024
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: gcplogs
+      options:
+        gcp-project: ${GCP_PROJECT_ID:-asc-internal-tools-dev}
+        labels: service=clusterodm-reference-node
+    networks:
+      gateway:
+        aliases:
+          - reference-node
+
+  clusterodm:
+    image: ${CLUSTERODM_IMAGE:?Set CLUSTERODM_IMAGE}
+    container_name: clusterodm
+    restart: unless-stopped
+    depends_on:
+      reference-node:
+        condition: service_healthy
+    command:
+      - --cloud-provider
+      - ascOAuth
+      - --public-address
+      - https://${GATEWAY_HOSTNAME}
+      - --asr
+      - ${ASR_CONFIG_PATH:-/run/secrets/gcp-asr.json}
+      - --admin-cli-port
+      - "8080"
+      - --admin-web-port
+      - "0"
+      - --stale-uploads-timeout
+      - "24"
+      - --no-splitmerge
+    environment:
+      SESSION_SECRET: ${SESSION_SECRET}
+      OAUTH_ALLOWED_DOMAINS: ${OAUTH_ALLOWED_DOMAINS:-}
+      CLUSTERODM_ADMIN_PASSWORD: ${CLUSTERODM_ADMIN_PASSWORD:?Set CLUSTERODM_ADMIN_PASSWORD}
+      REFERENCE_NODE_HOST: reference-node
+      REFERENCE_NODE_PORT: "3000"
+      REFERENCE_NODE_TOKEN: ${REFERENCE_NODE_TOKEN}
+      GOOGLE_CLOUD_PROJECT: ${GCP_PROJECT_ID:-asc-internal-tools-dev}
+    # Workers call /commit on the gateway internal IP (private VPC).
+    ports:
+      - "${GATEWAY_INTERNAL_IP:?Set GATEWAY_INTERNAL_IP}:3000:3000"
+    expose:
+      - "8080"
+    volumes:
+      - /var/lib/clusterodm/data:/var/www/data
+      - /var/lib/clusterodm/uploads:/var/www/tmp
+      - /var/lib/clusterodm/secrets:/run/secrets:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl -fsS http://localhost:3000/login.html >/dev/null
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    mem_limit: 1g
+    pids_limit: 1024
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: gcplogs
+      options:
+        gcp-project: ${GCP_PROJECT_ID:-asc-internal-tools-dev}
+        labels: service=clusterodm
+    networks:
+      - gateway
+
+  caddy:
+    image: caddy:2.10-alpine
+    container_name: clusterodm-caddy
+    restart: unless-stopped
+    depends_on:
+      clusterodm:
+        condition: service_healthy
+    environment:
+      GATEWAY_HOSTNAME: ${GATEWAY_HOSTNAME}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - /var/lib/clusterodm/caddy-data:/data
+      - /var/lib/clusterodm/caddy-config:/config
+    mem_limit: 256m
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: gcplogs
+      options:
+        gcp-project: ${GCP_PROJECT_ID:-asc-internal-tools-dev}
+        labels: service=clusterodm-caddy
+    networks:
+      - gateway
+
+networks:
+  gateway:
+    name: clusterodm-gateway

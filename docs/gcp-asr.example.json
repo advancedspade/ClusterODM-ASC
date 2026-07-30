@@ -1,0 +1,55 @@
+{
+    "provider": "gcp",
+    "project": "asc-internal-tools-dev",
+    "zone": [
+        "us-central1-a",
+        "us-central1-b"
+    ],
+    "network": "internal-tools-vpc",
+    "subnetwork": "internal-tools-us-central1",
+    "tags": [
+        "clusterodm-worker"
+    ],
+    "serviceAccount": "clusterodm-worker@asc-internal-tools-dev.iam.gserviceaccount.com",
+    "scopes": [
+        "https://www.googleapis.com/auth/cloud-platform"
+    ],
+    "machineImage": "projects/cos-cloud/global/images/family/cos-stable",
+    "useInternalIpOnly": true,
+    "skipFirewallCreate": true,
+    "preemptible": false,
+    "instanceLimit": 1,
+    "createRetries": 3,
+    "maxRuntime": 172800,
+    "maxUploadTime": 7200,
+    "imageSizeMapping": [
+        {
+            "maxImages": 800,
+            "slug": "n2-highmem-16",
+            "storage": 500,
+            "diskType": "pd-balanced",
+            "dockerMemory": "112g"
+        },
+        {
+            "maxImages": 5000,
+            "slug": "n2-highmem-32",
+            "storage": 1000,
+            "diskType": "pd-balanced",
+            "dockerMemory": "224g"
+        }
+    ],
+    "gcs": {
+        "enabled": true,
+        "bucket": "asc-nodeodm-outputs-dev",
+        "projectId": "asc-shared-services-dev",
+        "uploadPrefix": "outputs",
+        "uploadPaths": ".",
+        "cleanupAfterUpload": true
+    },
+    "webhookBaseUrl": "",
+    "dockerImage": "us-central1-docker.pkg.dev/asc-shared-services-dev/containers/nodeodm-asc:dev",
+    "dockerRegistry": {
+        "url": "https://us-central1-docker.pkg.dev",
+        "useInstanceCredentials": true
+    }
+}

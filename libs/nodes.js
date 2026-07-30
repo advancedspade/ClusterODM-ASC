@@ -49,6 +49,22 @@ module.exports = {
         }
     },
 
+    ensureLockedReference: function(hostname, port, token){
+        port = parseInt(port);
+        if (!hostname || isNaN(port)) return false;
+
+        let node = nodes.find(n => n.hostname() === hostname &&
+                                   parseInt(n.port()) === port &&
+                                  !n.isAutoSpawned());
+        if (!node) node = this.addUnique(hostname, port, token);
+        if (!node) return false;
+
+        node.setToken(token);
+        node.setLocked(true);
+        this.saveToDisk();
+        return node;
+    },
+
     add: function(node){
         nodes.push(node);
         logger.debug(`Added node: ${node}`);
@@ -122,6 +138,12 @@ module.exports = {
     // when returning calls to /info or /options)
     referenceNode: function(){
         return nodes.find(n => n.isOnline());
+    },
+
+    // The ASC public UI must always come from the locked, persistent
+    // NodeODM-ASC reference node, never from an ephemeral worker.
+    uiReferenceNode: function(){
+        return nodes.find(n => n.isOnline() && n.isLocked() && !n.isAutoSpawned());
     },
 
     maxTurnNumber: function(){

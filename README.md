@@ -94,6 +94,20 @@ A docker-compose file is available to automatically setup both ClusterODM and No
 docker-compose up
 ```
 
+### ASC on Google Cloud
+
+This fork adds:
+
+- a `gcp` autoscaling provider for ephemeral Google Compute Engine workers;
+- an `ascOAuth` cloud provider that accepts the NodeODM-ASC `ndm_oauth`
+  cookie;
+- proxy routing that serves the custom NodeODM-ASC UI and OAuth routes from a
+  locked reference node while ClusterODM handles task routes.
+
+See [docs/gcp.md](docs/gcp.md) and
+[docs/gcp-asr.example.json](docs/gcp-asr.example.json). Deploy to Helmut `dev`
+(`asc-internal-tools-dev`) before replicating IaC and secrets in production.
+
 ## Windows Bundle
 
 ClusterODM can run as a self-contained executable on Windows without the need for additional dependencies. You can download the latest `clusterodm-windows-x64.zip` bundle from the [releases](https://github.com/OpenDroneMap/ClusterODM/releases) page. Extract the contents in a folder and run:
