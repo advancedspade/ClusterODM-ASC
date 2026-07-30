@@ -171,6 +171,18 @@ module.exports = class GCPAsrProvider extends AbstractASRProvider{
         return "gce";
     }
 
+    // GCE names must match (?:[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?), but the base
+    // implementation appends a mixed-case short id, which instances.insert
+    // rejects outright.
+    generateHostname(imagesCount){
+        return super.generateHostname(imagesCount)
+            .toLowerCase()
+            .replace(/[^a-z0-9-]/g, "-")
+            .replace(/-{2,}/g, "-")
+            .slice(0, 63)
+            .replace(/-+$/, "");
+    }
+
     getMachinesLimit(){
         return this.getConfig("instanceLimit", -1);
     }
