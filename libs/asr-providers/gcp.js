@@ -35,6 +35,11 @@ GCS_UPLOAD_PREFIX=$(get_attr gcs-upload-prefix || true)
 GCS_UPLOAD_PATHS=$(get_attr gcs-upload-paths || true)
 REGISTRY_HOST=$(get_attr registry-host)
 
+# COS mounts / read-only, so the default HOME=/root makes both
+# docker-credential-gcr and the docker CLI fail to write .docker/config.json.
+export HOME=/var/lib/clusterodm-worker
+mkdir -p "\${HOME}"
+
 docker-credential-gcr configure-docker --registries="\${REGISTRY_HOST}"
 
 ARGS=(run -d --name nodeodm -p 3000:3000 --restart unless-stopped)
