@@ -63,7 +63,9 @@ gcloud auth configure-docker "${AR_HOST}" --quiet
 
 docker compose --env-file .env -f compose.yml config --quiet
 docker compose --env-file .env -f compose.yml pull
-docker compose --env-file .env -f compose.yml up -d --remove-orphans
+# --force-recreate: a deploy must converge on the uploaded .env. Without it
+# Compose has left reference-node running on a previous deploy's environment.
+docker compose --env-file .env -f compose.yml up -d --remove-orphans --force-recreate
 docker image prune -f >/dev/null 2>&1 || true
 
 echo "Waiting for Caddy/ClusterODM health..."

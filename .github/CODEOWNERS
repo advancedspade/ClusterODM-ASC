@@ -1,0 +1,7 @@
+# CODEOWNERS file
+# This file defines code ownership rules for the repository.
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# General rule: Require a review from either jon-aspade or Alonsodot for all changes
+* @jon-aspade @Alonsodot @samspade88
+
