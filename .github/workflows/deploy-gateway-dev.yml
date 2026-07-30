@@ -126,7 +126,10 @@ jobs:
         run: |
           set -euo pipefail
           GATEWAY_HOSTNAME="${GATEWAY_HOSTNAME:-${GATEWAY_HOSTNAME_DEFAULT}}"
-          OAUTH_ALLOWED_DOMAINS="${OAUTH_ALLOWED_DOMAINS:-advancedspadecompany.com}"
+          # Google Workspace domain of the sign-in accounts, which is not the
+          # domain the gateway is served from. ClusterODM reads this env var
+          # directly, so a wrong value passes login but 401s every proxied API.
+          OAUTH_ALLOWED_DOMAINS="${OAUTH_ALLOWED_DOMAINS:-aspadeco.com}"
 
           : "${SESSION_SECRET:?SESSION_SECRET is required}"
           : "${OAUTH_GOOGLE_CLIENT_ID:?OAUTH_GOOGLE_CLIENT_ID is required}"
