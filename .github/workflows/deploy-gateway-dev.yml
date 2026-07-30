@@ -11,7 +11,13 @@ name: Deploy ClusterODM Gateway (dev)
 # GitHub Environment: dev
 # Required secrets: SESSION_SECRET, OAUTH_GOOGLE_CLIENT_ID,
 #   OAUTH_GOOGLE_CLIENT_SECRET, REFERENCE_NODE_TOKEN, CLUSTERODM_ADMIN_PASSWORD
-# Optional vars: GATEWAY_HOSTNAME, OAUTH_ALLOWED_DOMAINS, PORTAL_SUPER_ENV_URL
+# Optional vars: GATEWAY_HOSTNAME, OAUTH_ALLOWED_DOMAINS
+#
+# Dev is a standalone portal: no PORTAL_SUPER_ENV_URL. Cross-host sign-in mints
+# a JWT signed with SESSION_SECRET and verifies it with the peer's own
+# SESSION_SECRET, so pairing dev with a host that has a different secret always
+# fails (error=bridge_invalid), and pairing them by sharing the secret would let
+# a dev compromise forge production sessions.
 # ASR config (deploy/clusterodm-gateway/gcp-asr.json) is committed — no HMAC.
 
 on:
@@ -117,12 +123,10 @@ jobs:
           OAUTH_ALLOWED_DOMAINS: ${{ vars.OAUTH_ALLOWED_DOMAINS }}
           REFERENCE_NODE_TOKEN: ${{ secrets.REFERENCE_NODE_TOKEN }}
           CLUSTERODM_ADMIN_PASSWORD: ${{ secrets.CLUSTERODM_ADMIN_PASSWORD }}
-          PORTAL_SUPER_ENV_URL: ${{ vars.PORTAL_SUPER_ENV_URL }}
         run: |
           set -euo pipefail
           GATEWAY_HOSTNAME="${GATEWAY_HOSTNAME:-${GATEWAY_HOSTNAME_DEFAULT}}"
           OAUTH_ALLOWED_DOMAINS="${OAUTH_ALLOWED_DOMAINS:-advancedspadecompany.com}"
-          PORTAL_SUPER_ENV_URL="${PORTAL_SUPER_ENV_URL:-https://superdrone.advancedspadecompany.com}"
 
           : "${SESSION_SECRET:?SESSION_SECRET is required}"
           : "${OAUTH_GOOGLE_CLIENT_ID:?OAUTH_GOOGLE_CLIENT_ID is required}"
@@ -159,9 +163,6 @@ jobs:
           OAUTH_SESSION_DAYS=30
           PORTAL_STAGING_ENV_LABEL=cluster dev
           PORTAL_STAGING_ENV_TAGLINE=On-demand processing
-          PORTAL_SUPER_ENV_URL=${PORTAL_SUPER_ENV_URL}
-          PORTAL_SUPER_ENV_LABEL=superdrone
-          PORTAL_SUPER_ENV_TAGLINE=Current production
           EOF
           sed -i 's/^[[:space:]]*//' .env
           chmod 600 .env
