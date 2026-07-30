@@ -49,11 +49,14 @@ data["webhookBaseUrl"] = f"http://{ip}:3000"
 path.write_text(json.dumps(data, indent=4) + "\n")
 PY
 
-# shellcheck disable=SC1091
-set -a
-# shellcheck disable=SC1091
-source .env
-set +a
+# .env is Compose's format, not shell: values may contain spaces, and secrets
+# may contain $(...) or backticks that bash would execute here as root. Compose
+# parses the file itself via --env-file, so only lift out the one key we need.
+GATEWAY_HOSTNAME="$(sed -n 's/^GATEWAY_HOSTNAME=//p' .env | head -n1)"
+if [[ -z "${GATEWAY_HOSTNAME}" ]]; then
+  echo "Missing GATEWAY_HOSTNAME in ${OPT_DIR}/.env" >&2
+  exit 1
+fi
 
 AR_HOST="${AR_HOST:-us-central1-docker.pkg.dev}"
 gcloud auth configure-docker "${AR_HOST}" --quiet
