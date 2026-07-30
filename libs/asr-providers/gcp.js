@@ -43,6 +43,10 @@ mkdir -p "\${HOME}"
 docker-credential-gcr configure-docker --registries="\${REGISTRY_HOST}"
 
 ARGS=(run -d --name nodeodm -p 3000:3000 --restart unless-stopped)
+# ASR deletes the VM as soon as the task settles, so anything NodeODM only
+# writes to the container log is unrecoverable unless it ships to Cloud Logging.
+# gcplogs reads the project from the metadata server.
+ARGS+=(--label service=clusterodm-worker --log-driver=gcplogs --log-opt labels=service)
 if [[ -n "\${DOCKER_MEMORY}" ]]; then
   ARGS+=(--memory="\${DOCKER_MEMORY}" --memory-swap="\${DOCKER_MEMORY}")
 fi
