@@ -146,6 +146,13 @@ jobs:
             exit 1
           fi
 
+          # Derived from the ASR config so the portal browses the same bucket
+          # the workers upload to.
+          GCS_BUCKET=$(jq -r '.gcs.bucket // ""' gcp-asr.json)
+          GCS_PROJECT_ID=$(jq -r '.gcs.projectId // ""' gcp-asr.json)
+          GCS_UPLOAD_PREFIX=$(jq -r '.gcs.uploadPrefix // "outputs"' gcp-asr.json)
+          : "${GCS_BUCKET:?gcs.bucket missing from gcp-asr.json}"
+
           NODEODM_IMAGE="${AR_LOCATION}-docker.pkg.dev/${AR_PROJECT_ID}/${AR_REPOSITORY}/${NODEODM_IMAGE_NAME}:${IMAGE_TAG}"
           CLUSTERODM_IMAGE="${AR_LOCATION}-docker.pkg.dev/${AR_PROJECT_ID}/${AR_REPOSITORY}/${CLUSTERODM_IMAGE_NAME}:${IMAGE_TAG}"
 
@@ -157,6 +164,9 @@ jobs:
           CLUSTERODM_IMAGE=${CLUSTERODM_IMAGE}
           NODEODM_IMAGE=${NODEODM_IMAGE}
           ASR_CONFIG_PATH=/run/secrets/gcp-asr.json
+          GCS_BUCKET=${GCS_BUCKET}
+          GCS_PROJECT_ID=${GCS_PROJECT_ID}
+          GCS_UPLOAD_PREFIX=${GCS_UPLOAD_PREFIX}
           SESSION_SECRET=${SESSION_SECRET}
           REFERENCE_NODE_TOKEN=${REFERENCE_NODE_TOKEN}
           CLUSTERODM_ADMIN_PASSWORD=${CLUSTERODM_ADMIN_PASSWORD}

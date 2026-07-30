@@ -23,6 +23,12 @@ services:
       OAUTH_SESSION_DAYS: ${OAUTH_SESSION_DAYS:-30}
       SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET}
       NODEODM_TOKEN: ${REFERENCE_NODE_TOKEN}
+      # Powers the portal's direct-to-GCS upload and project browser. The
+      # reference node never processes tasks, so it only reads/stages here;
+      # workers write the outputs.
+      GCS_BUCKET: ${GCS_BUCKET:-}
+      GCS_PROJECT_ID: ${GCS_PROJECT_ID:-}
+      GCS_UPLOAD_PREFIX: ${GCS_UPLOAD_PREFIX:-outputs}
       PORTAL_STAGING_ENV_URL: https://${GATEWAY_HOSTNAME}
       PORTAL_STAGING_ENV_LABEL: ${PORTAL_STAGING_ENV_LABEL:-cluster dev}
       PORTAL_STAGING_ENV_TAGLINE: ${PORTAL_STAGING_ENV_TAGLINE:-On-demand processing}
