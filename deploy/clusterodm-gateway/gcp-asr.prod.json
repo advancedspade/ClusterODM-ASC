@@ -1,6 +1,6 @@
 {
     "provider": "gcp",
-    "project": "asc-internal-tools-dev",
+    "project": "tools-471222",
     "zone": [
         "us-central1-a",
         "us-central1-b"
@@ -10,7 +10,7 @@
     "tags": [
         "clusterodm-worker"
     ],
-    "serviceAccount": "clusterodm-worker@asc-internal-tools-dev.iam.gserviceaccount.com",
+    "serviceAccount": "clusterodm-worker@tools-471222.iam.gserviceaccount.com",
     "scopes": [
         "https://www.googleapis.com/auth/cloud-platform"
     ],
@@ -40,14 +40,14 @@
     ],
     "gcs": {
         "enabled": true,
-        "bucket": "asc-nodeodm-outputs-dev",
-        "projectId": "asc-consumer-apps-dev",
+        "bucket": "asc-nodeodm-outputs-prod",
+        "projectId": "asc-consumer-apps",
         "uploadPrefix": "outputs",
         "uploadPaths": ".",
         "cleanupAfterUpload": true
     },
     "webhookBaseUrl": "",
-    "dockerImage": "us-central1-docker.pkg.dev/asc-shared-services-dev/containers/nodeodm-asc:dev",
+    "dockerImage": "us-central1-docker.pkg.dev/asc-shared-services/containers/nodeodm-asc:prod",
     "dockerRegistry": {
         "url": "https://us-central1-docker.pkg.dev",
         "useInstanceCredentials": true
