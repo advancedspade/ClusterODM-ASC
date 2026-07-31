@@ -1,7 +1,7 @@
 # ClusterODM dev end-to-end verification
 
-Run after Helmut apply (shared-services → internal-tool) and both CI workflows
-(`publish-ar-nodeodm-dev.yml`, then `deploy-gateway-dev.yml`).
+Run after Helmut apply (consumer-app bucket → internal-tool) and both CI
+workflows (`publish-ar-nodeodm-dev.yml`, then `deploy-gateway-dev.yml`).
 
 ## Preconditions
 
@@ -9,8 +9,8 @@ Run after Helmut apply (shared-services → internal-tool) and both CI workflows
   NodeODM-ASC UI after Google OAuth.
 - ASR config is mounted at `/run/secrets/gcp-asr.json` with
   `webhookBaseUrl` set to `http://<gateway-internal-ip>:3000`.
-- `asc-nodeodm-outputs-dev` exists; worker SA is objectAdmin, gateway SA is
-  objectViewer.
+- `asc-nodeodm-outputs-dev` exists in `asc-consumer-apps-dev` (public);
+  worker SA is objectAdmin, gateway SA is objectUser.
 
 ## Small dataset
 

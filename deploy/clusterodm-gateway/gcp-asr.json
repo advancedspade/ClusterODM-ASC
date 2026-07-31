@@ -41,7 +41,7 @@
     "gcs": {
         "enabled": true,
         "bucket": "asc-nodeodm-outputs-dev",
-        "projectId": "asc-shared-services-dev",
+        "projectId": "asc-consumer-apps-dev",
         "uploadPrefix": "outputs",
         "uploadPaths": ".",
         "cleanupAfterUpload": true
