@@ -24,6 +24,7 @@ const config = require('../config');
 const Curl = require('node-libcurl').Curl;
 const tasktable = require('./tasktable');
 const routetable = require('./routetable');
+const jobHistory = require('./jobHistory');
 const nodes = require('./nodes');
 const odmOptions = require('./odmOptions');
 const statusCodes = require('./statusCodes');
@@ -291,7 +292,7 @@ module.exports = {
         return odmOptions;
     },
 
-    process: async function(req, res, cloudProvider, uuid, params, token, limits, getLimitedOptions){
+    process: async function(req, res, cloudProvider, uuid, params, token, limits, getLimitedOptions, actor = null){
         const tmpPath = path.join("tmp", uuid);
         const { options, taskName, skipPostProcessing, outputs, dateCreated, fileNames, imagesCount, webhook } = params;
 
@@ -518,6 +519,14 @@ module.exports = {
                         logger.warn(`Cannot forward task ${uuid} to processing node ${node}: ${err.message}`);
                     }
                 }
+                await jobHistory.record(uuid, 'failed', {
+                    ownerKey: token,
+                    actor,
+                    name,
+                    imagesCount,
+                    status: jobHistory.STATUS.FAILED,
+                    detail: err.message
+                });
                 utils.rmdir(tmpPath);
                 eventEmitter.emit('close');
             };
@@ -564,6 +573,14 @@ module.exports = {
             // Add item to task table
             await tasktable.add(uuid, { taskInfo, abort: abortTask, output: ["Launching... please wait! This can take a few minutes."] }, token);
 
+            await jobHistory.record(uuid, 'launching', {
+                ownerKey: token,
+                actor,
+                name,
+                imagesCount,
+                status: jobHistory.STATUS.QUEUED
+            });
+
             // Send back response to user right away
             utils.json(res, { uuid });
 
@@ -588,6 +605,12 @@ module.exports = {
 
                 await routetable.add(uuid, node, token);
                 await tasktable.delete(uuid);
+                await jobHistory.record(uuid, 'routed', {
+                    ownerKey: token,
+                    actor,
+                    status: jobHistory.STATUS.RUNNING,
+                    detail: String(node)
+                });
 
                 utils.rmdir(tmpPath);
             }catch(e){

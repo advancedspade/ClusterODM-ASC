@@ -36,6 +36,34 @@ can fetch orthophoto TMS tiles from `storage.googleapis.com`. Legacy
 - Worker container logs use `--log-driver=gcplogs` (worker SA has
   `roles/logging.logWriter`).
 
+## Job history
+
+Routing state is short-lived: a route is dropped when the worker VM is deleted,
+and the task table lives only in memory. A separate ledger at
+`data/jobs.json` on the gateway's mounted volume keeps one durable row per job
+so users still see an outcome after teardown or a gateway restart.
+
+- Rows are keyed by task UUID and owned by the same hashed OAuth key used for
+  routing (`oauth:<sha256(sub)>`), so history is per-account. The signed-in
+  email and Google subject are stored alongside each event for attribution;
+  jobs started with the shared API token are attributed to `api` only.
+- Status is normalized to `queued`, `running`, `succeeded`, `failed`,
+  `canceled`, or `deleted`. A worker's `/commit` is authoritative and can
+  correct an optimistic cancel; nothing else moves a settled job except an
+  explicit restart. `deleted` is terminal.
+- `GET /task/history` returns the caller's rows, newest first, with their audit
+  events. `include_deleted=0` hides deleted rows. `GET /task/list` is unchanged.
+- Deleting a job is a soft delete: the row stays and records who removed it.
+  Worker cleanup still runs, and **GCS outputs are preserved** — neither
+  `outputs/<sanitized-name>/` nor `<task-uuid>/all.zip` is touched.
+- Removing or canceling a job whose worker is gone succeeds instead of failing
+  with a routing error, and `GET /task/<uuid>/info` falls back to the ledger's
+  last known outcome.
+
+History starts at deploy time; jobs that finished before this ledger existed
+have no row and are not recoverable, though they can still be dismissed from
+the UI.
+
 ## Required IaC (Helmut)
 
 - Gateway compute: `live/dev/internal-tool/` or `live/prod/internal-tool/`
@@ -86,3 +114,5 @@ After Helmut apply + gateway deploy:
 6. `gs://<bucket>/outputs/<sanitized-name>/` shape is unchanged.
 7. Anonymous `GET https://storage.googleapis.com/<bucket>/...` succeeds.
 8. Worker instance is deleted after task completion.
+9. The job appears under Job history with the signing account, and deleting it
+   there keeps the row and leaves the bucket objects in place.

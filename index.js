@@ -24,6 +24,7 @@ const nodes = require('./libs/nodes');
 const proxy = require('./libs/proxy');
 const floodMonitor = require('./libs/floodMonitor');
 const routetable = require('./libs/routetable');
+const jobHistory = require('./libs/jobHistory');
 
 (async function(){
     if (config.debug) logger.warn("Running in debug mode");
@@ -54,6 +55,7 @@ const routetable = require('./libs/routetable');
     const gracefulShutdown = async() => {
         await nodes.cleanup();
         await routetable.cleanup();
+        await jobHistory.cleanup();
         
         logger.info("Bye!");
         process.exit(0);

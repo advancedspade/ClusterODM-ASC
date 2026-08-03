@@ -1,6 +1,10 @@
 "use strict";
 
 const assert = require("assert");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const http = require("http");
 const jwt = require("jsonwebtoken");
 const Node = require("../libs/classes/Node");
 const GCPAsrProvider = require("../libs/asr-providers/gcp");
@@ -8,6 +12,10 @@ const AscOAuthCloudProvider = require("../libs/cloud-providers/AscOAuthCloudProv
 const config = require("../config");
 
 process.env.SESSION_SECRET = process.env.SESSION_SECRET || "test-session-secret-32chars-minimum!!";
+
+function tempHistoryFile(){
+    return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "clusterodm-history-")), "jobs.json");
+}
 
 async function testRoutes(){
     const routes = require("../libs/ascUiRoutes");
@@ -150,6 +158,224 @@ async function testStorageObjectKey(){
     assert.strictEqual(utils.storageObjectKey(taskId, ""), null);
 }
 
+async function testJobHistoryLedger(){
+    const jobHistory = require("../libs/jobHistory");
+    const statusCodes = require("../libs/statusCodes");
+    const file = tempHistoryFile();
+    const pilot = {source: "oauth", sub: "sub-1", email: "pilot@aspadeco.com"};
+
+    await jobHistory.initialize(file);
+
+    await jobHistory.record("job-1", "created", {
+        ownerKey: "oauth:owner-a",
+        actor: pilot,
+        name: "North field",
+        imagesCount: 120,
+        status: jobHistory.STATUS.QUEUED
+    });
+    await jobHistory.record("job-1", "routed", {status: jobHistory.STATUS.RUNNING});
+    await jobHistory.record("job-1", "finished", {statusCode: statusCodes.COMPLETED, force: true});
+
+    let job = await jobHistory.lookup("job-1");
+    assert.strictEqual(job.status, jobHistory.STATUS.SUCCEEDED);
+    assert.strictEqual(job.statusCode, statusCodes.COMPLETED);
+    assert.deepStrictEqual(job.createdBy, pilot);
+
+    // A duplicate webhook must not walk a finished job back to running.
+    await jobHistory.record("job-1", "finished", {statusCode: statusCodes.RUNNING, force: true});
+    job = await jobHistory.lookup("job-1");
+    assert.strictEqual(job.status, jobHistory.STATUS.SUCCEEDED, "duplicate commit must not regress status");
+
+    // Canceling an already finished job leaves the outcome alone.
+    await jobHistory.record("job-1", "canceled", {status: jobHistory.STATUS.CANCELED});
+    assert.strictEqual((await jobHistory.lookup("job-1")).status, jobHistory.STATUS.SUCCEEDED);
+
+    // A cancel recorded while running is corrected by the worker's result.
+    await jobHistory.record("job-2", "created", {ownerKey: "oauth:owner-a", status: jobHistory.STATUS.QUEUED});
+    await jobHistory.record("job-2", "routed", {status: jobHistory.STATUS.RUNNING});
+    await jobHistory.record("job-2", "canceled", {status: jobHistory.STATUS.CANCELED});
+    assert.strictEqual((await jobHistory.lookup("job-2")).status, jobHistory.STATUS.CANCELED);
+    await jobHistory.record("job-2", "finished", {statusCode: statusCodes.COMPLETED, force: true});
+    assert.strictEqual((await jobHistory.lookup("job-2")).status, jobHistory.STATUS.SUCCEEDED);
+
+    // Owner isolation.
+    await jobHistory.record("job-3", "created", {ownerKey: "oauth:owner-b", status: jobHistory.STATUS.QUEUED});
+    const ownerAJobs = await jobHistory.findByOwner("oauth:owner-a");
+    assert.deepStrictEqual(ownerAJobs.map(j => j.uuid).sort(), ["job-1", "job-2"]);
+    assert.deepStrictEqual((await jobHistory.findByOwner("oauth:owner-b")).map(j => j.uuid), ["job-3"]);
+
+    // Soft delete keeps the row and records who did it.
+    const remover = {source: "oauth", sub: "sub-2", email: "lead@aspadeco.com"};
+    await jobHistory.record("job-1", "deleted", {actor: remover, status: jobHistory.STATUS.DELETED});
+    job = await jobHistory.lookup("job-1");
+    assert.strictEqual(job.status, jobHistory.STATUS.DELETED);
+    assert.ok(job.deletedAt > 0);
+    assert.strictEqual(job.lastUpdatedBy.email, remover.email);
+    assert.strictEqual(job.lastUpdatedBy.action, "deleted");
+    assert.ok(job.events.some(e => e.action === "created" && e.actor && e.actor.email === pilot.email));
+    assert.ok(job.events.some(e => e.action === "deleted" && e.actor && e.actor.email === remover.email));
+
+    // Deletion is terminal, even against an authoritative late webhook.
+    await jobHistory.record("job-1", "finished", {statusCode: statusCodes.COMPLETED, force: true});
+    assert.strictEqual((await jobHistory.lookup("job-1")).status, jobHistory.STATUS.DELETED);
+
+    assert.deepStrictEqual(
+        (await jobHistory.findByOwner("oauth:owner-a", {includeDeleted: false})).map(j => j.uuid),
+        ["job-2"],
+        "deleted rows must be filterable"
+    );
+    assert.strictEqual((await jobHistory.findByOwner("oauth:owner-a")).length, 2, "deleted rows are retained");
+
+    // Restart revives a failed job.
+    await jobHistory.record("job-4", "created", {ownerKey: "oauth:owner-a", status: jobHistory.STATUS.QUEUED});
+    await jobHistory.record("job-4", "failed", {status: jobHistory.STATUS.FAILED, detail: "no nodes available"});
+    await jobHistory.record("job-4", "restarted", {status: jobHistory.STATUS.RUNNING, allowRevive: true});
+    assert.strictEqual((await jobHistory.lookup("job-4")).status, jobHistory.STATUS.RUNNING);
+
+    // Survives a restart of the gateway.
+    await jobHistory.saveToDisk();
+    await jobHistory.initialize(file);
+    const reloaded = await jobHistory.lookup("job-1");
+    assert.strictEqual(reloaded.status, jobHistory.STATUS.DELETED);
+    assert.strictEqual(reloaded.name, "North field");
+    assert.strictEqual(reloaded.imagesCount, 120);
+    assert.strictEqual((await jobHistory.findByOwner("oauth:owner-a")).length, 3);
+
+    const taskInfo = jobHistory.toTaskInfo(await jobHistory.lookup("job-2"));
+    assert.strictEqual(taskInfo.uuid, "job-2");
+    assert.strictEqual(taskInfo.status.code, statusCodes.COMPLETED);
+    assert.strictEqual(taskInfo.progress, 100);
+
+    assert.deepStrictEqual(await jobHistory.ownership("job-1", "oauth:owner-a"), {found: true, owned: true});
+    assert.deepStrictEqual(await jobHistory.ownership("job-1", "oauth:owner-b"), {found: true, owned: false});
+    assert.deepStrictEqual(await jobHistory.ownership("unknown-job", "oauth:owner-a"), {found: false, owned: false});
+}
+
+// Removing a finished job used to fail with "no nodes in routing table" once the
+// worker VM was gone, leaving a row the user could not dismiss.
+async function testRemoveWithoutRoute(){
+    const jobHistory = require("../libs/jobHistory");
+    const LocalCloudProvider = require("../libs/cloud-providers/LocalCloudProvider");
+
+    let proxy = null;
+    try{
+        proxy = require("../libs/proxy");
+    }catch(e){
+        // node-libcurl ships a prebuilt binding; a dev machine whose
+        // node_modules were installed for another architecture cannot load the
+        // proxy at all. Run `npm test` in the Docker image to cover this.
+        if (String(e.message).indexOf("node_libcurl.node") === -1) throw e;
+        console.log("SKIP testRemoveWithoutRoute: node-libcurl binding unavailable on this architecture");
+        return;
+    }
+
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "clusterodm-proxy-"));
+    fs.mkdirSync(path.join(workDir, "data"));
+    fs.mkdirSync(path.join(workDir, "tmp"));
+
+    const originalCwd = process.cwd();
+    const originalToken = config.token;
+    config.token = "";
+    process.chdir(workDir);
+
+    let server = null;
+    try{
+        const servers = await proxy.initialize(new LocalCloudProvider());
+        server = servers[0].server;
+        await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+        const port = server.address().port;
+
+        const request = (method, urlPath, body) => {
+            return new Promise((resolve, reject) => {
+                const payload = body === undefined ? null : Buffer.from(body);
+                const req = http.request({
+                    host: "127.0.0.1",
+                    port,
+                    path: urlPath,
+                    method,
+                    headers: payload ? {
+                        "Content-Type": "multipart/form-data; boundary=----t",
+                        "Content-Length": payload.length
+                    } : {}
+                }, res => {
+                    let data = "";
+                    res.on("data", c => { data += c; });
+                    res.on("end", () => {
+                        try{
+                            resolve({statusCode: res.statusCode, body: JSON.parse(data)});
+                        }catch(e){
+                            reject(new Error(`Bad JSON from ${urlPath}: ${data}`));
+                        }
+                    });
+                });
+                req.on("error", reject);
+                if (payload) req.write(payload);
+                req.end();
+            });
+        };
+
+        const removeBody = (uuid) =>
+            `------t\r\nContent-Disposition: form-data; name="uuid"\r\n\r\n${uuid}\r\n------t--\r\n`;
+
+        const legacyTask = "11111111-1111-4111-8111-111111111111";
+        const finishedTask = "22222222-2222-4222-8222-222222222222";
+
+        // Predates the ledger: nothing to update, but the client must be able
+        // to drop the row instead of seeing a routing error.
+        const unknown = await request("POST", "/task/remove?token=owner-a", removeBody(legacyTask));
+        assert.strictEqual(unknown.body.success, true, `expected success, got ${JSON.stringify(unknown.body)}`);
+
+        await jobHistory.record(finishedTask, "created", {
+            ownerKey: "owner-a",
+            actor: {source: "oauth", sub: "s", email: "pilot@aspadeco.com"},
+            name: "Finished job",
+            status: jobHistory.STATUS.QUEUED
+        });
+        await jobHistory.record(finishedTask, "finished", {statusCode: 40, force: true});
+
+        // The worker is gone, so info falls back to the durable outcome.
+        const info = await request("GET", `/task/${finishedTask}/info?token=owner-a`);
+        assert.strictEqual(info.body.status.code, 40, `expected durable status, got ${JSON.stringify(info.body)}`);
+        assert.strictEqual(info.body.name, "Finished job");
+
+        const removed = await request("POST", "/task/remove?token=owner-a", removeBody(finishedTask));
+        assert.strictEqual(removed.body.success, true, `expected success, got ${JSON.stringify(removed.body)}`);
+        assert.strictEqual((await jobHistory.lookup(finishedTask)).status, jobHistory.STATUS.DELETED);
+
+        // Removal is idempotent.
+        const again = await request("POST", "/task/remove?token=owner-a", removeBody(finishedTask));
+        assert.strictEqual(again.body.success, true);
+        assert.strictEqual((await jobHistory.lookup(finishedTask)).status, jobHistory.STATUS.DELETED);
+
+        // Another account cannot touch it, and does not see it in history.
+        const foreign = await request("POST", "/task/remove?token=owner-b", removeBody(finishedTask));
+        assert.ok(foreign.body.error && foreign.body.error.indexOf("another account") !== -1,
+                  `expected ownership error, got ${JSON.stringify(foreign.body)}`);
+
+        const foreignInfo = await request("GET", `/task/${finishedTask}/info?token=owner-b`);
+        assert.ok(foreignInfo.body.error, "history must not leak across accounts");
+
+        const history = await request("GET", "/task/history?token=owner-a");
+        assert.deepStrictEqual(history.body.jobs.map(j => j.uuid), [finishedTask]);
+        assert.strictEqual(history.body.jobs[0].status, jobHistory.STATUS.DELETED);
+        assert.strictEqual(history.body.jobs[0].createdBy.email, "pilot@aspadeco.com");
+
+        const withoutDeleted = await request("GET", "/task/history?token=owner-a&include_deleted=0");
+        assert.deepStrictEqual(withoutDeleted.body.jobs, []);
+
+        assert.deepStrictEqual((await request("GET", "/task/history?token=owner-b")).body.jobs, []);
+
+        // Restart cannot be honored without a node, and says so.
+        const restart = await request("POST", "/task/restart?token=owner-a", removeBody(finishedTask));
+        assert.ok(restart.body.error && restart.body.error.indexOf("no longer available") !== -1,
+                  `expected restart guidance, got ${JSON.stringify(restart.body)}`);
+    }finally{
+        if (server) await new Promise(resolve => server.close(resolve));
+        process.chdir(originalCwd);
+        config.token = originalToken;
+    }
+}
+
 async function testReferenceNodeTokenRotation(){
     const node = new Node("reference-node", 3000, "old-token");
     node.setToken("new-token");
@@ -164,7 +390,12 @@ async function testReferenceNodeTokenRotation(){
     await testGcpProvider();
     await testStorageObjectKey();
     await testReferenceNodeTokenRotation();
+    await testJobHistoryLedger();
+    await testRemoveWithoutRoute();
     console.log("All tests passed");
+
+    // The proxy's housekeeping intervals keep the event loop alive.
+    process.exit(0);
 })().catch(err => {
     console.error(err.stack || err);
     process.exit(1);
