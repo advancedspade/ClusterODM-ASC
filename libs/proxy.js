@@ -556,89 +556,94 @@ module.exports = {
                         }
                     });
                     busboy.on('finish', async function() {
-                        if (taskId){
-                            concurrencyMonitor.decreaseCount(userToken);
+                        if (!taskId){
+                            json(res, { error: `No uuid found in ${pathname}`});
+                            return;
+                        }
+                        if (!utils.isTaskUuid(taskId)){
+                            json(res, { error: `Invalid uuid`});
+                            return;
+                        }
 
-                            const recordAction = async () => {
-                                if (pathname === '/task/remove'){
-                                    await jobHistory.record(taskId, 'deleted', {
-                                        ownerKey: userToken,
-                                        actor,
-                                        status: jobHistory.STATUS.DELETED
-                                    });
-                                }else if (pathname === '/task/cancel'){
-                                    await jobHistory.record(taskId, 'canceled', {
-                                        ownerKey: userToken,
-                                        actor,
-                                        status: jobHistory.STATUS.CANCELED
-                                    });
-                                }else{
-                                    await jobHistory.record(taskId, 'restarted', {
-                                        ownerKey: userToken,
-                                        actor,
-                                        status: jobHistory.STATUS.RUNNING,
-                                        allowRevive: true
-                                    });
-                                }
-                            };
+                        concurrencyMonitor.decreaseCount(userToken);
 
-                            let node = await routetable.lookupNode(taskId);
-                            if (node){
-                                await recordAction();
-                                overrideRequest(req, node, query, pathname);
-                                proxy.web(req, res, { 
-                                        target: node.proxyTargetUrl(),
-                                        buffer: utils.stringToStream(body)
-                                    });
+                        const recordAction = async () => {
+                            if (pathname === '/task/remove'){
+                                await jobHistory.record(taskId, 'deleted', {
+                                    ownerKey: userToken,
+                                    actor,
+                                    status: jobHistory.STATUS.DELETED
+                                });
+                            }else if (pathname === '/task/cancel'){
+                                await jobHistory.record(taskId, 'canceled', {
+                                    ownerKey: userToken,
+                                    actor,
+                                    status: jobHistory.STATUS.CANCELED
+                                });
                             }else{
-                                const taskTableEntry = await tasktable.lookup(taskId);
-                                if (taskTableEntry && taskTableEntry.taskInfo){
-                                    if (pathname === '/task/cancel' || pathname === '/task/remove'){
-                                        if (taskTableEntry.abort){
-                                            taskTableEntry.abort();
-                                            taskTableEntry.abort = null;
-                                            logger.info(`Task ${taskId} aborted via ${pathname}`);
-                                        }
-                                        
-                                        utils.rmdir(`tmp/${taskId}`);
+                                await jobHistory.record(taskId, 'restarted', {
+                                    ownerKey: userToken,
+                                    actor,
+                                    status: jobHistory.STATUS.RUNNING,
+                                    allowRevive: true
+                                });
+                            }
+                        };
 
-                                        if (pathname === '/task/remove'){
-                                            await tasktable.delete(taskId);
-                                        }
-
-                                        if (pathname === '/task/cancel'){
-                                            taskTableEntry.taskInfo.status.code = statusCodes.CANCELED;
-                                            await tasktable.add(taskId, taskTableEntry, userToken);
-                                        }
-
-                                        await recordAction();
-                                        json(res, { success: true });
-                                    }else{
-                                        json(res, { error: `Action not supported. Please create a new task.` });
+                        let node = await routetable.lookupNode(taskId);
+                        if (node){
+                            await recordAction();
+                            overrideRequest(req, node, query, pathname);
+                            proxy.web(req, res, { 
+                                    target: node.proxyTargetUrl(),
+                                    buffer: utils.stringToStream(body)
+                                });
+                        }else{
+                            const taskTableEntry = await tasktable.lookup(taskId);
+                            if (taskTableEntry && taskTableEntry.taskInfo){
+                                if (pathname === '/task/cancel' || pathname === '/task/remove'){
+                                    if (taskTableEntry.abort){
+                                        taskTableEntry.abort();
+                                        taskTableEntry.abort = null;
+                                        logger.info(`Task ${taskId} aborted via ${pathname}`);
                                     }
+                                    
+                                    utils.rmdir(path.join('tmp', taskId));
+
+                                    if (pathname === '/task/remove'){
+                                        await tasktable.delete(taskId);
+                                    }
+
+                                    if (pathname === '/task/cancel'){
+                                        taskTableEntry.taskInfo.status.code = statusCodes.CANCELED;
+                                        await tasktable.add(taskId, taskTableEntry, userToken);
+                                    }
+
+                                    await recordAction();
+                                    json(res, { success: true });
                                 }else{
-                                    // The worker is gone and nothing is cached, which is the
-                                    // normal end state of an autoscaled job. Removing and
-                                    // canceling are idempotent, so report success and keep the
-                                    // history row instead of failing on a missing route.
-                                    const { found, owned } = await jobHistory.ownership(taskId, userToken);
-                                    if (found && !owned){
-                                        json(res, { error: `Task ${taskId} belongs to another account.`});
-                                    }else if (pathname === '/task/restart'){
-                                        json(res, { error: `Cannot restart task ${taskId}: its processing node is no longer available. Please create a new task.`});
-                                    }else{
-                                        utils.rmdir(`tmp/${taskId}`);
+                                    json(res, { error: `Action not supported. Please create a new task.` });
+                                }
+                            }else{
+                                // The worker is gone and nothing is cached, which is the
+                                // normal end state of an autoscaled job. Removing and
+                                // canceling are idempotent, so report success and keep the
+                                // history row instead of failing on a missing route.
+                                const { found, owned } = await jobHistory.ownership(taskId, userToken);
+                                if (found && !owned){
+                                    json(res, { error: `Task ${taskId} belongs to another account.`});
+                                }else if (pathname === '/task/restart'){
+                                    json(res, { error: `Cannot restart task ${taskId}: its processing node is no longer available. Please create a new task.`});
+                                }else{
+                                    utils.rmdir(path.join('tmp', taskId));
 
-                                        // Jobs predating the history ledger have no row to
-                                        // update, but the client still needs to drop them.
-                                        if (found) await recordAction();
+                                    // Jobs predating the history ledger have no row to
+                                    // update, but the client still needs to drop them.
+                                    if (found) await recordAction();
 
-                                        json(res, { success: true });
-                                    }
+                                    json(res, { success: true });
                                 }
                             }
-                        }else{
-                            json(res, { error: `No uuid found in ${pathname}`});
                         }
                     });
 

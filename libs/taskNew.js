@@ -57,7 +57,7 @@ const getUuid = async (req) => {
         
         // Valid UUID and no other task with same UUID?
         console.log(userUuid);
-        if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(userUuid)){
+        if (utils.isTaskUuid(userUuid)){
             if (await tasktable.lookup(userUuid)){
                 throw new Error(`Invalid set-uuid: ${userUuid}`);
             }else if (await routetable.lookup(userUuid)){
@@ -206,10 +206,10 @@ module.exports = {
     },
 
     getTaskIdFromPath: function(pathname){
-        const matches = pathname.match(/\/([\w\d]+\-[\w\d]+\-[\w\d]+\-[\w\d]+\-[\w\d]+)$/);
+        const matches = pathname.match(/\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i);
 
-        if (matches && matches[1]){
-            return matches[1];        
+        if (matches && matches[1] && utils.isTaskUuid(matches[1])){
+            return matches[1];
         }else return null;
     },
 

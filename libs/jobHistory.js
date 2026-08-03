@@ -149,9 +149,13 @@ function applyStatus(record, status, options = {}){
 
     const now = options.at || new Date().getTime();
     if (status === STATUS.RUNNING && !record.startedAt) record.startedAt = now;
-    if (TERMINAL.indexOf(status) !== -1){
+
+    if (status === STATUS.DELETED){
+        // Keep the real completion time; deletion is tracked separately.
+        record.deletedAt = now;
+        if (!record.finishedAt) record.finishedAt = now;
+    }else if (TERMINAL.indexOf(status) !== -1){
         record.finishedAt = now;
-        if (status === STATUS.DELETED) record.deletedAt = now;
     }else{
         record.finishedAt = null;
     }

@@ -135,6 +135,13 @@ async function testStorageObjectKey(){
     const utils = require("../libs/utils");
     const taskId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
+    assert.strictEqual(utils.isTaskUuid(taskId), false, "version nibble must be 1-5");
+    assert.strictEqual(utils.isTaskUuid("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"), true);
+    assert.strictEqual(utils.isTaskUuid("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee; rm -rf /"), false);
+    assert.strictEqual(utils.isTaskUuid("../tmp"), false);
+    assert.strictEqual(utils.isTaskUuid(""), false);
+    assert.strictEqual(utils.isTaskUuid(null), false);
+
     assert.strictEqual(utils.storageObjectKey(taskId, "all.zip"), `${taskId}/all.zip`);
     assert.strictEqual(
         utils.storageObjectKey(taskId, "odm_orthophoto/odm_orthophoto.tif"),
@@ -206,14 +213,24 @@ async function testJobHistoryLedger(){
 
     // Soft delete keeps the row and records who did it.
     const remover = {source: "oauth", sub: "sub-2", email: "lead@aspadeco.com"};
+    const finishedAtBeforeDelete = (await jobHistory.lookup("job-1")).finishedAt;
+    assert.ok(finishedAtBeforeDelete > 0);
     await jobHistory.record("job-1", "deleted", {actor: remover, status: jobHistory.STATUS.DELETED});
     job = await jobHistory.lookup("job-1");
     assert.strictEqual(job.status, jobHistory.STATUS.DELETED);
     assert.ok(job.deletedAt > 0);
+    assert.strictEqual(job.finishedAt, finishedAtBeforeDelete, "delete must not overwrite completion time");
+    assert.ok(job.deletedAt >= finishedAtBeforeDelete);
     assert.strictEqual(job.lastUpdatedBy.email, remover.email);
     assert.strictEqual(job.lastUpdatedBy.action, "deleted");
     assert.ok(job.events.some(e => e.action === "created" && e.actor && e.actor.email === pilot.email));
     assert.ok(job.events.some(e => e.action === "deleted" && e.actor && e.actor.email === remover.email));
+
+    // Deleting a never-finished job still stamps finishedAt once.
+    await jobHistory.record("job-delete-only", "created", {ownerKey: "oauth:owner-a", status: jobHistory.STATUS.QUEUED});
+    await jobHistory.record("job-delete-only", "deleted", {status: jobHistory.STATUS.DELETED});
+    const deletedOnly = await jobHistory.lookup("job-delete-only");
+    assert.strictEqual(deletedOnly.finishedAt, deletedOnly.deletedAt);
 
     // Deletion is terminal, even against an authoritative late webhook.
     await jobHistory.record("job-1", "finished", {statusCode: statusCodes.COMPLETED, force: true});
@@ -224,7 +241,7 @@ async function testJobHistoryLedger(){
         ["job-2"],
         "deleted rows must be filterable"
     );
-    assert.strictEqual((await jobHistory.findByOwner("oauth:owner-a")).length, 2, "deleted rows are retained");
+    assert.strictEqual((await jobHistory.findByOwner("oauth:owner-a")).length, 3, "deleted rows are retained");
 
     // Restart revives a failed job.
     await jobHistory.record("job-4", "created", {ownerKey: "oauth:owner-a", status: jobHistory.STATUS.QUEUED});
@@ -239,7 +256,7 @@ async function testJobHistoryLedger(){
     assert.strictEqual(reloaded.status, jobHistory.STATUS.DELETED);
     assert.strictEqual(reloaded.name, "North field");
     assert.strictEqual(reloaded.imagesCount, 120);
-    assert.strictEqual((await jobHistory.findByOwner("oauth:owner-a")).length, 3);
+    assert.strictEqual((await jobHistory.findByOwner("oauth:owner-a")).length, 4);
 
     const taskInfo = jobHistory.toTaskInfo(await jobHistory.lookup("job-2"));
     assert.strictEqual(taskInfo.uuid, "job-2");
