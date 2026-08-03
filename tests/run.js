@@ -205,11 +205,15 @@ async function testJobHistoryLedger(){
     await jobHistory.record("job-2", "finished", {statusCode: statusCodes.COMPLETED, force: true});
     assert.strictEqual((await jobHistory.lookup("job-2")).status, jobHistory.STATUS.SUCCEEDED);
 
-    // Owner isolation.
+    // Owner is still stored for attribution, but listing is org-wide.
     await jobHistory.record("job-3", "created", {ownerKey: "oauth:owner-b", status: jobHistory.STATUS.QUEUED});
     const ownerAJobs = await jobHistory.findByOwner("oauth:owner-a");
     assert.deepStrictEqual(ownerAJobs.map(j => j.uuid).sort(), ["job-1", "job-2"]);
     assert.deepStrictEqual((await jobHistory.findByOwner("oauth:owner-b")).map(j => j.uuid), ["job-3"]);
+    assert.deepStrictEqual(
+        (await jobHistory.list()).map(j => j.uuid).sort(),
+        ["job-1", "job-2", "job-3"]
+    );
 
     // Soft delete keeps the row and records who did it.
     const remover = {source: "oauth", sub: "sub-2", email: "lead@aspadeco.com"};
@@ -364,23 +368,32 @@ async function testRemoveWithoutRoute(){
         assert.strictEqual(again.body.success, true);
         assert.strictEqual((await jobHistory.lookup(finishedTask)).status, jobHistory.STATUS.DELETED);
 
-        // Another account cannot touch it, and does not see it in history.
-        const foreign = await request("POST", "/task/remove?token=owner-b", removeBody(finishedTask));
-        assert.ok(foreign.body.error && foreign.body.error.indexOf("another account") !== -1,
-                  `expected ownership error, got ${JSON.stringify(foreign.body)}`);
+        // Another teammate can see and soft-delete the same job; actor is recorded.
+        const sharedTask = "33333333-3333-4333-8333-333333333333";
+        await jobHistory.record(sharedTask, "created", {
+            ownerKey: "owner-a",
+            actor: {source: "oauth", sub: "s", email: "pilot@aspadeco.com"},
+            name: "Shared job",
+            status: jobHistory.STATUS.QUEUED
+        });
+        await jobHistory.record(sharedTask, "finished", {statusCode: 40, force: true});
 
-        const foreignInfo = await request("GET", `/task/${finishedTask}/info?token=owner-b`);
-        assert.ok(foreignInfo.body.error, "history must not leak across accounts");
+        const teammateInfo = await request("GET", `/task/${sharedTask}/info?token=owner-b`);
+        assert.strictEqual(teammateInfo.body.status.code, 40, `teammates must see durable status, got ${JSON.stringify(teammateInfo.body)}`);
 
-        const history = await request("GET", "/task/history?token=owner-a");
-        assert.deepStrictEqual(history.body.jobs.map(j => j.uuid), [finishedTask]);
-        assert.strictEqual(history.body.jobs[0].status, jobHistory.STATUS.DELETED);
-        assert.strictEqual(history.body.jobs[0].createdBy.email, "pilot@aspadeco.com");
+        const teammateRemove = await request("POST", "/task/remove?token=owner-b", removeBody(sharedTask));
+        assert.strictEqual(teammateRemove.body.success, true, `expected teammate remove success, got ${JSON.stringify(teammateRemove.body)}`);
+        assert.strictEqual((await jobHistory.lookup(sharedTask)).status, jobHistory.STATUS.DELETED);
+
+        const history = await request("GET", "/task/history?token=owner-b");
+        const historyIds = history.body.jobs.map(j => j.uuid);
+        assert.ok(historyIds.indexOf(finishedTask) !== -1);
+        assert.ok(historyIds.indexOf(sharedTask) !== -1);
+        const sharedRow = history.body.jobs.find(j => j.uuid === sharedTask);
+        assert.strictEqual(sharedRow.createdBy.email, "pilot@aspadeco.com");
 
         const withoutDeleted = await request("GET", "/task/history?token=owner-a&include_deleted=0");
         assert.deepStrictEqual(withoutDeleted.body.jobs, []);
-
-        assert.deepStrictEqual((await request("GET", "/task/history?token=owner-b")).body.jobs, []);
 
         // Restart cannot be honored without a node, and says so.
         const restart = await request("POST", "/task/restart?token=owner-a", removeBody(finishedTask));
