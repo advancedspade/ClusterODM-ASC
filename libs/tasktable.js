@@ -78,5 +78,13 @@ module.exports = {
             }
         }
         return result;
+    },
+
+    findAll: async function(){
+        const result = {};
+        for (let taskId in tasks){
+            result[taskId] = tasks[taskId].obj;
+        }
+        return result;
     }
 };

@@ -119,6 +119,25 @@ module.exports = {
         });
     },
 
+    findAll: async function(activeOnly = false){
+        const result = {};
+        for (let taskId in routes){
+            result[taskId] = routes[taskId];
+        }
+        if (!activeOnly) return result;
+
+        return new Promise((resolve) => {
+            async.each(Object.keys(result), (taskId, cb) => {
+                (routes[taskId]).node.taskInfo(taskId).then((taskInfo) => {
+                    if (taskInfo.error) delete(result[taskId]);
+                    cb();
+                });
+            }, () => {
+                resolve(result);
+            });
+        });
+    },
+
     lookupNode: async function(taskId){
         const entry = await this.lookup(taskId);
         if (entry) return entry.node;

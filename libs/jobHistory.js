@@ -22,9 +22,10 @@ const path = require('path');
 const logger = require('./logger');
 const statusCodes = require('./statusCodes');
 
-// Durable per-user job ledger. Unlike routetable (routing only, expires) and
-// tasktable (memory only), this survives gateway restarts and worker teardown,
-// so users keep seeing a job's outcome and who acted on it.
+// Durable job ledger for the gateway. Unlike routetable (routing only, expires)
+// and tasktable (memory only), this survives gateway restarts and worker
+// teardown. Any authenticated teammate can list all rows; actor email/sub on
+// each event shows who worked on a job.
 
 const DEFAULT_HISTORY_FILE = path.join('data', 'jobs.json');
 const SCHEMA_VERSION = 1;
@@ -290,11 +291,21 @@ module.exports = {
 
     findByOwner: async function(ownerKey, options = {}){
         if (!jobs || !ownerKey) return [];
+        return this.list(Object.assign({}, options, {ownerKey}));
+    },
+
+    /**
+     * Org-wide history for the authenticated gateway. Owner is still stored for
+     * attribution; listing is not filtered by it unless ownerKey is passed.
+     */
+    list: async function(options = {}){
+        if (!jobs) return [];
         const includeDeleted = options.includeDeleted !== false;
+        const ownerKey = options.ownerKey || null;
 
         const result = Object.keys(jobs)
             .map(uuid => jobs[uuid])
-            .filter(job => job.ownerKey === ownerKey)
+            .filter(job => !ownerKey || job.ownerKey === ownerKey)
             .filter(job => includeDeleted || job.status !== STATUS.DELETED)
             .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 

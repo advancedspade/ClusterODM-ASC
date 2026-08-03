@@ -43,22 +43,24 @@ and the task table lives only in memory. A separate ledger at
 `data/jobs.json` on the gateway's mounted volume keeps one durable row per job
 so users still see an outcome after teardown or a gateway restart.
 
-- Rows are keyed by task UUID and owned by the same hashed OAuth key used for
-  routing (`oauth:<sha256(sub)>`), so history is per-account. The signed-in
-  email and Google subject are stored alongside each event for attribution;
-  jobs started with the shared API token are attributed to `api` only.
+- Rows are keyed by task UUID. The creating account's hashed OAuth key
+  (`oauth:<sha256(sub)>`) is stored for routing/attribution, and the signed-in
+  email / Google subject are stored on each event so the team can see who
+  worked on a job. Jobs started with the shared API token are attributed to
+  `api` only.
 - Status is normalized to `queued`, `running`, `succeeded`, `failed`,
   `canceled`, or `deleted`. A worker's `/commit` is authoritative and can
   correct an optimistic cancel; nothing else moves a settled job except an
   explicit restart. `deleted` is terminal.
-- `GET /task/history` returns the caller's rows, newest first, with their audit
-  events. `include_deleted=0` hides deleted rows. `GET /task/list` is unchanged.
+- This is an internal tool: any authenticated user (domain-restricted OAuth)
+  can list all jobs via `GET /task/history` and all live task IDs via
+  `GET /task/list`. `include_deleted=0` hides deleted history rows.
 - Deleting a job is a soft delete: the row stays and records who removed it.
   Worker cleanup still runs, and **GCS outputs are preserved** — neither
   `outputs/<sanitized-name>/` nor `<task-uuid>/all.zip` is touched.
 - Removing or canceling a job whose worker is gone succeeds instead of failing
   with a routing error, and `GET /task/<uuid>/info` falls back to the ledger's
-  last known outcome.
+  last known outcome for any signed-in teammate.
 
 History starts at deploy time; jobs that finished before this ledger existed
 have no row and are not recoverable, though they can still be dismissed from

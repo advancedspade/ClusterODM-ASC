@@ -627,19 +627,16 @@ module.exports = {
                             }else{
                                 // The worker is gone and nothing is cached, which is the
                                 // normal end state of an autoscaled job. Removing and
-                                // canceling are idempotent, so report success and keep the
-                                // history row instead of failing on a missing route.
-                                const { found, owned } = await jobHistory.ownership(taskId, userToken);
-                                if (found && !owned){
-                                    json(res, { error: `Task ${taskId} belongs to another account.`});
-                                }else if (pathname === '/task/restart'){
+                                // canceling are idempotent for any signed-in teammate.
+                                const job = await jobHistory.lookup(taskId);
+                                if (pathname === '/task/restart'){
                                     json(res, { error: `Cannot restart task ${taskId}: its processing node is no longer available. Please create a new task.`});
                                 }else{
                                     utils.rmdir(path.join('tmp', taskId));
 
                                     // Jobs predating the history ledger have no row to
                                     // update, but the client still needs to drop them.
-                                    if (found) await recordAction();
+                                    if (job) await recordAction();
 
                                     json(res, { success: true });
                                 }
@@ -651,23 +648,23 @@ module.exports = {
                 }else if (req.method === 'GET' && pathname === '/task/history') {
                     const includeDeleted = ['0', 'false'].indexOf(String(query.include_deleted)) === -1;
                     json(res, {
-                        jobs: await jobHistory.findByOwner(userToken, {
+                        jobs: await jobHistory.list({
                             includeDeleted,
                             limit: query.limit
                         })
                     });
                 }else if (req.method === 'GET' && pathname === '/task/list') {
                     const taskIds = {};
-                    const taskTableEntries = await tasktable.findByToken(userToken);
+                    const taskTableEntries = await tasktable.findAll();
                     for (let taskId in taskTableEntries){
                         taskIds[taskId] = true;
                     }
 
-                    const routeTableEntries = await routetable.findByToken(userToken, true);
+                    const routeTableEntries = await routetable.findAll(true);
                     for (let taskId in routeTableEntries){
                         taskIds[taskId] = true;
                     }
-                    
+
                     json(res, Object.keys(taskIds).map(uuid => { return { uuid } }));
                 }else{
                     // Lookup task id
@@ -823,7 +820,7 @@ module.exports = {
                                 // outcome so a refresh shows the result rather than
                                 // a routing error.
                                 const job = await jobHistory.lookup(taskId);
-                                if (job && job.ownerKey === userToken){
+                                if (job){
                                     if (action === 'info'){
                                         const taskInfo = jobHistory.toTaskInfo(job);
                                         if (query.with_output !== undefined) taskInfo.output = [];
