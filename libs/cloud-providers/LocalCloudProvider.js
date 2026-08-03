@@ -26,7 +26,8 @@ module.exports = class LocalCloudProvider extends AbstractCloudProvider{
     async validate(token){
         const ok = {
             valid: true,
-            limits: [] // No limits
+            limits: [], // No limits
+            actor: {source: "local"}
         };
         
         if (config.token === "") return ok; // No token required?

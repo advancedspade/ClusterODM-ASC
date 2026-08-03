@@ -29,6 +29,7 @@ const config = require('../config');
 const utils = require('./utils');
 const routetable = require('./routetable');
 const tasktable = require('./tasktable');
+const jobHistory = require('./jobHistory');
 const logger = require('./logger');
 const accessLog = require('./accessLog');
 const statusCodes = require('./statusCodes');
@@ -47,6 +48,7 @@ module.exports = {
         utils.cleanupTemporaryDirectory(config.stale_uploads_timeout);
         await routetable.initialize();
         await tasktable.initialize();
+        await jobHistory.initialize();
 
         setInterval(() => {
             utils.cleanupTemporaryDirectory(config.stale_uploads_timeout);
@@ -252,7 +254,17 @@ module.exports = {
                         
                         const token = await routetable.lookupToken(taskId);
                         concurrencyMonitor.decreaseCount(token);
-                        
+
+                        // The worker is authoritative, so this overrides an
+                        // optimistic cancel recorded while it was still running.
+                        await jobHistory.record(taskId, 'finished', {
+                            ownerKey: token || undefined,
+                            statusCode: taskInfo.status ? taskInfo.status.code : undefined,
+                            name: taskInfo.name,
+                            imagesCount: taskInfo.imagesCount,
+                            force: true
+                        });
+
                         try{
                             cloudProvider.taskFinished(token, taskInfo);
                         }catch(e){
@@ -278,6 +290,7 @@ module.exports = {
                 const valid = validation && validation.valid;
                 const limits = (validation && validation.limits) || {};
                 const userToken = (validation && validation.token) || query.token;
+                const actor = (validation && validation.actor) || null;
                 req.clusterAuthToken = (validation && validation.accessToken) || query.token;
                 if (!valid || query._debugUnauthorized){
                     // json(res, {error: "Invalid authentication token"});
@@ -352,9 +365,16 @@ module.exports = {
 
                         // Save
                         fs.writeFile(path.join(tmpPath, "body.json"),
-                                    JSON.stringify(params), {encoding: 'utf8'}, err => {
+                                    JSON.stringify(params), {encoding: 'utf8'}, async err => {
                             if (err) json(res, { error: err });
                             else{
+                                await jobHistory.record(uuid, 'created', {
+                                    ownerKey: userToken,
+                                    actor,
+                                    name: params.taskName,
+                                    status: jobHistory.STATUS.QUEUED
+                                });
+
                                 // All good
                                 json(res, { uuid });
                             }
@@ -416,6 +436,12 @@ module.exports = {
                             utils.rmdir(tmpPath);
                             utils.json(res, {error: err});
                             asrProvider.cleanup(taskId);
+                            jobHistory.record(taskId, 'failed', {
+                                ownerKey: userToken,
+                                actor,
+                                status: jobHistory.STATUS.FAILED,
+                                detail: err
+                            });
                         };
 
                         if (concurrencyMonitor.checkCommitLimitReached(limits.maxConcurrentTasks, userToken)){
@@ -459,8 +485,15 @@ module.exports = {
                                 body.fileNames = files;
                                 body.imagesCount = files.length;
 
+                                await jobHistory.record(taskId, 'uploaded', {
+                                    ownerKey: userToken,
+                                    actor,
+                                    name: body.taskName,
+                                    imagesCount: body.imagesCount
+                                });
+
                                 try{
-                                    await taskNew.process(req, res, cloudProvider, taskId, body, userToken, limits, getLimitedOptions);
+                                    await taskNew.process(req, res, cloudProvider, taskId, body, userToken, limits, getLimitedOptions, actor);
                                 }catch(e){
                                     die(e.message);
                                     return;
@@ -490,9 +523,23 @@ module.exports = {
                             return;
                         }
 
+                        await jobHistory.record(uuid, 'created', {
+                            ownerKey: userToken,
+                            actor,
+                            name: params.taskName,
+                            imagesCount: params.imagesCount,
+                            status: jobHistory.STATUS.QUEUED
+                        });
+
                         try{
-                            await taskNew.process(req, res, cloudProvider, uuid, params, userToken, limits, getLimitedOptions);
+                            await taskNew.process(req, res, cloudProvider, uuid, params, userToken, limits, getLimitedOptions, actor);
                         }catch(e){
+                            await jobHistory.record(uuid, 'failed', {
+                                ownerKey: userToken,
+                                actor,
+                                status: jobHistory.STATUS.FAILED,
+                                detail: e.message
+                            });
                             die(e.message);
                             return;
                         }
@@ -509,51 +556,106 @@ module.exports = {
                         }
                     });
                     busboy.on('finish', async function() {
-                        if (taskId){
-                            concurrencyMonitor.decreaseCount(userToken);
+                        if (!taskId){
+                            json(res, { error: `No uuid found in ${pathname}`});
+                            return;
+                        }
+                        if (!utils.isTaskUuid(taskId)){
+                            json(res, { error: `Invalid uuid`});
+                            return;
+                        }
 
-                            let node = await routetable.lookupNode(taskId);
-                            if (node){
-                                overrideRequest(req, node, query, pathname);
-                                proxy.web(req, res, { 
-                                        target: node.proxyTargetUrl(),
-                                        buffer: utils.stringToStream(body)
-                                    });
+                        concurrencyMonitor.decreaseCount(userToken);
+
+                        const recordAction = async () => {
+                            if (pathname === '/task/remove'){
+                                await jobHistory.record(taskId, 'deleted', {
+                                    ownerKey: userToken,
+                                    actor,
+                                    status: jobHistory.STATUS.DELETED
+                                });
+                            }else if (pathname === '/task/cancel'){
+                                await jobHistory.record(taskId, 'canceled', {
+                                    ownerKey: userToken,
+                                    actor,
+                                    status: jobHistory.STATUS.CANCELED
+                                });
                             }else{
-                                const taskTableEntry = await tasktable.lookup(taskId);
-                                if (taskTableEntry && taskTableEntry.taskInfo){
-                                    if (pathname === '/task/cancel' || pathname === '/task/remove'){
-                                        if (taskTableEntry.abort){
-                                            taskTableEntry.abort();
-                                            taskTableEntry.abort = null;
-                                            logger.info(`Task ${taskId} aborted via ${pathname}`);
-                                        }
-                                        
-                                        utils.rmdir(`tmp/${taskId}`);
+                                await jobHistory.record(taskId, 'restarted', {
+                                    ownerKey: userToken,
+                                    actor,
+                                    status: jobHistory.STATUS.RUNNING,
+                                    allowRevive: true
+                                });
+                            }
+                        };
 
-                                        if (pathname === '/task/remove'){
-                                            await tasktable.delete(taskId);
-                                        }
-
-                                        if (pathname === '/task/cancel'){
-                                            taskTableEntry.taskInfo.status.code = statusCodes.CANCELED;
-                                            await tasktable.add(taskId, taskTableEntry, userToken);
-                                        }
-
-                                        json(res, { success: true });
-                                    }else{
-                                        json(res, { error: `Action not supported. Please create a new task.` });
+                        let node = await routetable.lookupNode(taskId);
+                        if (node){
+                            await recordAction();
+                            overrideRequest(req, node, query, pathname);
+                            proxy.web(req, res, { 
+                                    target: node.proxyTargetUrl(),
+                                    buffer: utils.stringToStream(body)
+                                });
+                        }else{
+                            const taskTableEntry = await tasktable.lookup(taskId);
+                            if (taskTableEntry && taskTableEntry.taskInfo){
+                                if (pathname === '/task/cancel' || pathname === '/task/remove'){
+                                    if (taskTableEntry.abort){
+                                        taskTableEntry.abort();
+                                        taskTableEntry.abort = null;
+                                        logger.info(`Task ${taskId} aborted via ${pathname}`);
                                     }
+                                    
+                                    utils.rmdir(path.join('tmp', taskId));
+
+                                    if (pathname === '/task/remove'){
+                                        await tasktable.delete(taskId);
+                                    }
+
+                                    if (pathname === '/task/cancel'){
+                                        taskTableEntry.taskInfo.status.code = statusCodes.CANCELED;
+                                        await tasktable.add(taskId, taskTableEntry, userToken);
+                                    }
+
+                                    await recordAction();
+                                    json(res, { success: true });
                                 }else{
-                                    json(res, { error: `Invalid route for taskId ${taskId}, no nodes in routing table.`});
+                                    json(res, { error: `Action not supported. Please create a new task.` });
+                                }
+                            }else{
+                                // The worker is gone and nothing is cached, which is the
+                                // normal end state of an autoscaled job. Removing and
+                                // canceling are idempotent, so report success and keep the
+                                // history row instead of failing on a missing route.
+                                const { found, owned } = await jobHistory.ownership(taskId, userToken);
+                                if (found && !owned){
+                                    json(res, { error: `Task ${taskId} belongs to another account.`});
+                                }else if (pathname === '/task/restart'){
+                                    json(res, { error: `Cannot restart task ${taskId}: its processing node is no longer available. Please create a new task.`});
+                                }else{
+                                    utils.rmdir(path.join('tmp', taskId));
+
+                                    // Jobs predating the history ledger have no row to
+                                    // update, but the client still needs to drop them.
+                                    if (found) await recordAction();
+
+                                    json(res, { success: true });
                                 }
                             }
-                        }else{
-                            json(res, { error: `No uuid found in ${pathname}`});
                         }
                     });
 
                     utils.stringToStream(body).pipe(busboy);
+                }else if (req.method === 'GET' && pathname === '/task/history') {
+                    const includeDeleted = ['0', 'false'].indexOf(String(query.include_deleted)) === -1;
+                    json(res, {
+                        jobs: await jobHistory.findByOwner(userToken, {
+                            includeDeleted,
+                            limit: query.limit
+                        })
+                    });
                 }else if (req.method === 'GET' && pathname === '/task/list') {
                     const taskIds = {};
                     const taskTableEntries = await tasktable.findByToken(userToken);
@@ -717,7 +819,23 @@ module.exports = {
                                     json(res, { error: `Invalid route for taskId ${taskId}:${action}, no valid route possible.`});
                                 }
                             }else{
-                                json(res, { error: `Invalid route for taskId ${taskId}:${action}, no task table entry.`});
+                                // Nothing live and nothing cached: serve the durable
+                                // outcome so a refresh shows the result rather than
+                                // a routing error.
+                                const job = await jobHistory.lookup(taskId);
+                                if (job && job.ownerKey === userToken){
+                                    if (action === 'info'){
+                                        const taskInfo = jobHistory.toTaskInfo(job);
+                                        if (query.with_output !== undefined) taskInfo.output = [];
+                                        json(res, taskInfo);
+                                    }else if (action === 'output'){
+                                        json(res, []);
+                                    }else{
+                                        json(res, { error: `Invalid route for taskId ${taskId}:${action}, no valid route possible.`});
+                                    }
+                                }else{
+                                    json(res, { error: `Invalid route for taskId ${taskId}:${action}, no task table entry.`});
+                                }
                             }
                         }
                     }else{

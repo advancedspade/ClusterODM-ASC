@@ -53,6 +53,12 @@ module.exports = {
         return uuidv4();
     },
 
+    // Task ids are used in shell-backed rmdir paths; reject anything that is not
+    // a plain UUID before it reaches the filesystem.
+    isTaskUuid: function(value){
+        return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || ""));
+    },
+
     // Object storage key for a task asset. Deliberately avoids path.join,
     // which collapses ".." and would let a download request escape the
     // taskId prefix and read unrelated objects in the bucket.

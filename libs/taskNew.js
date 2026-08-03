@@ -24,6 +24,7 @@ const config = require('../config');
 const Curl = require('node-libcurl').Curl;
 const tasktable = require('./tasktable');
 const routetable = require('./routetable');
+const jobHistory = require('./jobHistory');
 const nodes = require('./nodes');
 const odmOptions = require('./odmOptions');
 const statusCodes = require('./statusCodes');
@@ -56,7 +57,7 @@ const getUuid = async (req) => {
         
         // Valid UUID and no other task with same UUID?
         console.log(userUuid);
-        if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(userUuid)){
+        if (utils.isTaskUuid(userUuid)){
             if (await tasktable.lookup(userUuid)){
                 throw new Error(`Invalid set-uuid: ${userUuid}`);
             }else if (await routetable.lookup(userUuid)){
@@ -205,10 +206,10 @@ module.exports = {
     },
 
     getTaskIdFromPath: function(pathname){
-        const matches = pathname.match(/\/([\w\d]+\-[\w\d]+\-[\w\d]+\-[\w\d]+\-[\w\d]+)$/);
+        const matches = pathname.match(/\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i);
 
-        if (matches && matches[1]){
-            return matches[1];        
+        if (matches && matches[1] && utils.isTaskUuid(matches[1])){
+            return matches[1];
         }else return null;
     },
 
@@ -291,7 +292,7 @@ module.exports = {
         return odmOptions;
     },
 
-    process: async function(req, res, cloudProvider, uuid, params, token, limits, getLimitedOptions){
+    process: async function(req, res, cloudProvider, uuid, params, token, limits, getLimitedOptions, actor = null){
         const tmpPath = path.join("tmp", uuid);
         const { options, taskName, skipPostProcessing, outputs, dateCreated, fileNames, imagesCount, webhook } = params;
 
@@ -518,6 +519,14 @@ module.exports = {
                         logger.warn(`Cannot forward task ${uuid} to processing node ${node}: ${err.message}`);
                     }
                 }
+                await jobHistory.record(uuid, 'failed', {
+                    ownerKey: token,
+                    actor,
+                    name,
+                    imagesCount,
+                    status: jobHistory.STATUS.FAILED,
+                    detail: err.message
+                });
                 utils.rmdir(tmpPath);
                 eventEmitter.emit('close');
             };
@@ -564,6 +573,14 @@ module.exports = {
             // Add item to task table
             await tasktable.add(uuid, { taskInfo, abort: abortTask, output: ["Launching... please wait! This can take a few minutes."] }, token);
 
+            await jobHistory.record(uuid, 'launching', {
+                ownerKey: token,
+                actor,
+                name,
+                imagesCount,
+                status: jobHistory.STATUS.QUEUED
+            });
+
             // Send back response to user right away
             utils.json(res, { uuid });
 
@@ -588,6 +605,12 @@ module.exports = {
 
                 await routetable.add(uuid, node, token);
                 await tasktable.delete(uuid);
+                await jobHistory.record(uuid, 'routed', {
+                    ownerKey: token,
+                    actor,
+                    status: jobHistory.STATUS.RUNNING,
+                    detail: String(node)
+                });
 
                 utils.rmdir(tmpPath);
             }catch(e){
