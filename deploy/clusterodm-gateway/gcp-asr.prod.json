@@ -3,7 +3,9 @@
     "project": "tools-471222",
     "zone": [
         "us-central1-a",
-        "us-central1-b"
+        "us-central1-b",
+        "us-central1-c",
+        "us-central1-f"
     ],
     "network": "internal-tools-vpc",
     "subnetwork": "internal-tools-us-central1",
@@ -19,7 +21,7 @@
     "skipFirewallCreate": true,
     "preemptible": false,
     "instanceLimit": 1,
-    "createRetries": 3,
+    "createRetries": 8,
     "maxRuntime": 172800,
     "maxUploadTime": 7200,
     "imageSizeMapping": [
