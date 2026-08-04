@@ -11,7 +11,7 @@ durable results, calls ClusterODM's `/commit` webhook, and is deleted.
 |---|---|---|
 | Gateway project | `asc-internal-tools-dev` | `tools-471222` |
 | Gateway VM | `clusterodm-gateway-dev` | `clusterodm-gateway-prod` |
-| Hostname | `dev.drone.advancedspadecompany.com` | `drone.advancedspadecompany.com` |
+| Hostname | `dev.dronez.advancedspadecompany.com` | `dronez.advancedspadecompany.com` |
 | Outputs bucket | `asc-nodeodm-outputs-dev` in `asc-consumer-apps-dev` | `asc-nodeodm-outputs-prod` in `asc-consumer-apps` |
 | Images | `asc-shared-services-dev/containers` `:dev` | `asc-shared-services/containers` `:prod` |
 | ASR file | `gcp-asr.json` | `gcp-asr.prod.json` |

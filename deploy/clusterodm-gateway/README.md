@@ -4,8 +4,8 @@ Owned by **ClusterODM-ASC**. Deploys to Helmut-managed gateway VMs.
 
 | Env | VM | Hostname | ASR file | Image tag |
 |-----|-----|----------|----------|-----------|
-| Dev | `clusterodm-gateway-dev` | `dev.drone.advancedspadecompany.com` | `gcp-asr.json` | `:dev` |
-| Prod | `clusterodm-gateway-prod` | `drone.advancedspadecompany.com` | `gcp-asr.prod.json` | `:prod` |
+| Dev | `clusterodm-gateway-dev` | `dev.dronez.advancedspadecompany.com` | `gcp-asr.json` | `:dev` |
+| Prod | `clusterodm-gateway-prod` | `dronez.advancedspadecompany.com` | `gcp-asr.prod.json` | `:prod` |
 
 ## Services
 
@@ -55,7 +55,7 @@ deploy time.
 |---|---|---|
 | GitHub Environment | `dev` | `prod` |
 | Trigger branch | `dev` | `main` |
-| Default hostname | `dev.drone.advancedspadecompany.com` | `drone.advancedspadecompany.com` |
+| Default hostname | `dev.dronez.advancedspadecompany.com` | `dronez.advancedspadecompany.com` |
 
 Required secrets: `SESSION_SECRET`, `OAUTH_GOOGLE_CLIENT_ID`,
 `OAUTH_GOOGLE_CLIENT_SECRET`, `REFERENCE_NODE_TOKEN`,

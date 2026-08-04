@@ -5,7 +5,7 @@ workflows (`publish-ar-nodeodm-dev.yml`, then `deploy-gateway-dev.yml`).
 
 ## Preconditions
 
-- `https://dev.drone.advancedspadecompany.com/login.html` serves the
+- `https://dev.dronez.advancedspadecompany.com/login.html` serves the
   NodeODM-ASC UI after Google OAuth.
 - ASR config is mounted at `/run/secrets/gcp-asr.json` with
   `webhookBaseUrl` set to `http://<gateway-internal-ip>:3000`.
