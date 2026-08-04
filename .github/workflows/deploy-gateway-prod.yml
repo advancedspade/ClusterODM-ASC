@@ -33,7 +33,7 @@ env:
   IMAGE_TAG: prod
   WIF_PROVIDER: projects/809964514017/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
   SA_EMAIL: clusterodm-deployer@tools-471222.iam.gserviceaccount.com
-  GATEWAY_HOSTNAME_DEFAULT: drone.advancedspadecompany.com
+  GATEWAY_HOSTNAME_DEFAULT: dronez.advancedspadecompany.com
 
 permissions:
   contents: read
