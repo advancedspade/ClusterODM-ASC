@@ -11,7 +11,7 @@ durable results, calls ClusterODM's `/commit` webhook, and is deleted.
 |---|---|---|
 | Gateway project | `asc-internal-tools-dev` | `tools-471222` |
 | Gateway VM | `clusterodm-gateway-dev` | `clusterodm-gateway-prod` |
-| Hostname | `dev.drone.advancedspadecompany.com` | `drone.advancedspadecompany.com` |
+| Hostname | `dev.dronez.advancedspadecompany.com` | `dronez.advancedspadecompany.com` |
 | Outputs bucket | `asc-nodeodm-outputs-dev` in `asc-consumer-apps-dev` | `asc-nodeodm-outputs-prod` in `asc-consumer-apps` |
 | Images | `asc-shared-services-dev/containers` `:dev` | `asc-shared-services/containers` `:prod` |
 | ASR file | `gcp-asr.json` | `gcp-asr.prod.json` |
@@ -35,6 +35,36 @@ can fetch orthophoto TMS tiles from `storage.googleapis.com`. Legacy
   post-teardown downloads.
 - Worker container logs use `--log-driver=gcplogs` (worker SA has
   `roles/logging.logWriter`).
+
+## Job history
+
+Routing state is short-lived: a route is dropped when the worker VM is deleted,
+and the task table lives only in memory. A separate ledger at
+`data/jobs.json` on the gateway's mounted volume keeps one durable row per job
+so users still see an outcome after teardown or a gateway restart.
+
+- Rows are keyed by task UUID. The creating account's hashed OAuth key
+  (`oauth:<sha256(sub)>`) is stored for routing/attribution, and the signed-in
+  email / Google subject are stored on each event so the team can see who
+  worked on a job. Jobs started with the shared API token are attributed to
+  `api` only.
+- Status is normalized to `queued`, `running`, `succeeded`, `failed`,
+  `canceled`, or `deleted`. A worker's `/commit` is authoritative and can
+  correct an optimistic cancel; nothing else moves a settled job except an
+  explicit restart. `deleted` is terminal.
+- This is an internal tool: any authenticated user (domain-restricted OAuth)
+  can list all jobs via `GET /task/history` and all live task IDs via
+  `GET /task/list`. `include_deleted=0` hides deleted history rows.
+- Deleting a job is a soft delete: the row stays and records who removed it.
+  Worker cleanup still runs, and **GCS outputs are preserved** — neither
+  `outputs/<sanitized-name>/` nor `<task-uuid>/all.zip` is touched.
+- Removing or canceling a job whose worker is gone succeeds instead of failing
+  with a routing error, and `GET /task/<uuid>/info` falls back to the ledger's
+  last known outcome for any signed-in teammate.
+
+History starts at deploy time; jobs that finished before this ledger existed
+have no row and are not recoverable, though they can still be dismissed from
+the UI.
 
 ## Required IaC (Helmut)
 
@@ -86,3 +116,5 @@ After Helmut apply + gateway deploy:
 6. `gs://<bucket>/outputs/<sanitized-name>/` shape is unchanged.
 7. Anonymous `GET https://storage.googleapis.com/<bucket>/...` succeeds.
 8. Worker instance is deleted after task completion.
+9. The job appears under Job history with the signing account, and deleting it
+   there keeps the row and leaves the bucket objects in place.

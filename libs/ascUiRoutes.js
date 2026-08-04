@@ -8,6 +8,7 @@ const PUBLIC_PAGE_PATHS = new Set([
     "/home",
     "/uploads",
     "/incomplete",
+    "/history",
     "/auth/bootstrap"
 ]);
 

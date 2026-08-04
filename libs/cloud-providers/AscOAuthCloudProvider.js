@@ -91,7 +91,12 @@ module.exports = class AscOAuthCloudProvider extends AbstractCloudProvider{
                 valid: true,
                 limits: {},
                 token: ownerKey("oauth", payload.sub),
-                accessToken: this.issueInternalToken(payload)
+                accessToken: this.issueInternalToken(payload),
+                actor: {
+                    source: "oauth",
+                    sub: String(payload.sub),
+                    email: payload.email || ""
+                }
             };
         }
 
@@ -101,7 +106,10 @@ module.exports = class AscOAuthCloudProvider extends AbstractCloudProvider{
                 valid: true,
                 limits: {},
                 token: ownerKey("api", token),
-                accessToken: token
+                accessToken: token,
+                // The shared token is a credential, so automation is only ever
+                // identified by kind.
+                actor: {source: "api"}
             };
         }
 

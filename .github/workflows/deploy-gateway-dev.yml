@@ -38,7 +38,7 @@ env:
   IMAGE_TAG: dev
   WIF_PROVIDER: projects/809964514017/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
   SA_EMAIL: clusterodm-deployer@asc-internal-tools-dev.iam.gserviceaccount.com
-  GATEWAY_HOSTNAME_DEFAULT: dev.drone.advancedspadecompany.com
+  GATEWAY_HOSTNAME_DEFAULT: dev.dronez.advancedspadecompany.com
 
 permissions:
   contents: read

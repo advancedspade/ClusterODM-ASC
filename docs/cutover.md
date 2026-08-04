@@ -26,8 +26,8 @@ completes. DNS is the cutover switch.
    - NodeODM `publish-ar-nodeodm-prod.yml` (`:prod`)
    - ClusterODM `deploy-gateway-prod.yml` (uses `gcp-asr.prod.json`)
 4. Smoke on the new VM IP with
-   `Host: drone.advancedspadecompany.com` before moving DNS.
-5. Point `drone.advancedspadecompany.com` at `clusterodm_gateway_ip`.
+   `Host: dronez.advancedspadecompany.com` before moving DNS.
+5. Point `dronez.advancedspadecompany.com` at `clusterodm_gateway_ip`.
    Keep a short TTL ahead of the change. DNS only (grey cloud).
 6. Point Ayer at `asc-nodeodm-outputs-prod` (separate change; Ayer still
    hardcodes `nodeodm-outputs-v1` until then).
