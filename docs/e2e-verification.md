@@ -37,22 +37,32 @@ workflows (`publish-ar-nodeodm-dev.yml`, then `deploy-gateway-dev.yml`).
 4. After completion:
 
    ```bash
+   # Should NOT exist for new jobs (on-demand zip replaces it)
    gsutil ls gs://asc-nodeodm-outputs-dev/<task-uuid>/all.zip
+
+   # Curated outputs — no opensfm/, no all.zip, no duplicate images/
    gsutil ls gs://asc-nodeodm-outputs-dev/outputs/<sanitized-name>/
    ```
 
 5. Confirm the worker is deleted and
-   `/task/<uuid>/download/all.zip` streams through the gateway.
+   `/task/<uuid>/download/all.zip` streams an on-demand zip through the
+   gateway (built from `outputs/<sanitized-name>/`).
+
+6. On the Projects page: the new job appears with history metadata; a
+   legacy folder (no ledger row) appears with Download / Re-process only.
+   Confirm single-file download (e.g. orthophoto GeoTIFF) and a multi-select
+   subset zip both work.
 
 ## Large dataset
 
 Repeat with a set that maps to `n2-highmem-32` (`maxImages` > 800). Confirm
-machine type, disk size, and docker memory from the ASR mapping.
+machine type, disk size, and docker memory from the ASR mapping. Measure
+wall-clock time vs a prior large job to quantify the archive/upload savings.
 
 ## Failure signals
 
 - Worker with an external IP → ASR still attaching `accessConfigs`.
 - `/commit` never arrives → firewall or `webhookBaseUrl` / port bind wrong.
 - AR pull fails → Private Google Access or worker AR reader IAM.
-- Download 404 after teardown → missing `--gcs_task_archive` or gateway
-  objectViewer.
+- Download 404 after teardown → missing `outputs/<sanitized-name>/` tree,
+  job-ledger name mismatch, or gateway/reference-node GCS access.

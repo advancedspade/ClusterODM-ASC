@@ -95,7 +95,35 @@ async function testGcpProvider(){
 
     const args = await provider.getCreateArgs(700, 1);
     assert.ok(args.indexOf("--no-address") !== -1);
-    assert.ok(args.indexOf("n2-highmem-16") !== -1);
+    assert.ok(args.indexOf("c3-highmem-22") !== -1);
+
+    // Retry ladder: exhaust every zone on one machine type before falling back.
+    provider.config.zone = ["us-central1-a", "us-central1-b"];
+    const ladder = [1, 2, 3, 4, 5, 6, 7].map(attempt => {
+        const plan = provider.getAttemptPlan(700, attempt);
+        return `${plan.image.slug}@${plan.zone}`;
+    });
+    assert.deepStrictEqual(ladder, [
+        "c3-highmem-22@us-central1-a",
+        "c3-highmem-22@us-central1-b",
+        "n2-highmem-16@us-central1-a",
+        "n2-highmem-16@us-central1-b",
+        "n2d-highmem-16@us-central1-a",
+        "n2d-highmem-16@us-central1-b",
+        "c3-highmem-22@us-central1-a"
+    ]);
+
+    // Fallbacks inherit disk settings and override only what differs.
+    const fallback = provider.getAttemptPlan(700, 3).image;
+    assert.strictEqual(fallback.dockerMemory, "112g");
+    assert.strictEqual(fallback.storage, 500);
+    assert.strictEqual(fallback.fallbacks, undefined);
+
+    // Back off only once the whole zone/machine-type matrix has been swept.
+    assert.strictEqual(provider.getFailureSleepTime(6), 1000);
+    assert.strictEqual(provider.getFailureSleepTime(7), 10000);
+
+    provider.config.zone = ["us-central1-a"];
 
     const spec = await provider.getInstanceSpec(
         700,
@@ -108,7 +136,7 @@ async function testGcpProvider(){
 
     assert.strictEqual(spec.name, "clusterodm-700-test");
     assert.strictEqual(spec.zone, "us-central1-a");
-    assert.ok(spec.machineType.indexOf("n2-highmem-16") !== -1);
+    assert.ok(spec.machineType.indexOf("c3-highmem-22") !== -1);
     assert.strictEqual(spec.networkInterfaces[0].accessConfigs, undefined);
     assert.strictEqual(spec.shieldedInstanceConfig.enableSecureBoot, true);
     assert.strictEqual(spec.shieldedInstanceConfig.enableVtpm, true);
@@ -118,12 +146,13 @@ async function testGcpProvider(){
     const meta = {};
     spec.metadata.items.forEach(item => { meta[item.key] = item.value; });
     assert.ok(meta["startup-script"].indexOf("docker-credential-gcr") !== -1);
-    assert.ok(meta["startup-script"].indexOf("--gcs_task_archive") !== -1);
+    assert.ok(meta["startup-script"].indexOf("--gcs_skip_local_archive") !== -1);
+    assert.ok(meta["startup-script"].indexOf("--gcs_task_archive") === -1);
     assert.strictEqual(meta["docker-image"], provider.config.dockerImage);
     assert.strictEqual(meta["node-token"], "worker-token");
     assert.strictEqual(meta["gcs-bucket"], "results-bucket");
     assert.ok(meta.webhook.indexOf("http://10.0.0.5:3000/commit") === 0);
-    assert.strictEqual(meta["docker-memory"], "112g");
+    assert.strictEqual(meta["docker-memory"], "154g");
     assert.strictEqual(meta["registry-host"], "us-central1-docker.pkg.dev");
 
     const client = provider.createMachineClient("clusterodm-700-test");
