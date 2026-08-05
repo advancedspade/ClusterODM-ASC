@@ -109,6 +109,30 @@ module.exports = class GceMachine{
         return this._ip;
     }
 
+    /**
+     * Teardown callers only know the instance name, and a delete aimed at the
+     * wrong zone 404s, which is indistinguishable from "already deleted".
+     * Returns the zone the instance actually lives in, or null if it's gone.
+     */
+    async locateZone(){
+        const filter = encodeURIComponent(`name = "${this.machineName}"`);
+        let pageToken = "";
+        do{
+            const query = `filter=${filter}&maxResults=500` + (pageToken ? `&pageToken=${pageToken}` : "");
+            const res = await this._authorizedRequest(
+                "GET",
+                `/projects/${this.project}/aggregated/instances?${query}`
+            );
+            for (const scope of Object.values(res.items || {})){
+                const match = (scope.instances || []).find(i => i.name === this.machineName);
+                if (match) return String(match.zone || "").split("/").pop() || null;
+            }
+            pageToken = res.nextPageToken || "";
+        }while (pageToken);
+
+        return null;
+    }
+
     async rm(force){
         try{
             logger.info(`Deleting GCE instance ${this.machineName}`);

@@ -16,6 +16,15 @@ const logger = require("../logger");
 const COS_IMAGE = "projects/cos-cloud/global/images/family/cos-stable";
 const DEFAULT_NODE_ONLINE_ATTEMPTS = 60;
 const DEFAULT_NODE_ONLINE_SLEEP_MS = 5000;
+// Curated outputs only — excludes opensfm/, images/, gcp/, and all.zip.
+// Must stay in sync with NodeODM config-default.json gcsUploadPaths.
+const DEFAULT_GCS_UPLOAD_PATHS = [
+    "odm_orthophoto", "odm_dem", "odm_report", "odm_georeferencing",
+    "odm_meshing", "odm_texturing", "odm_texturing_25d", "odm_filterpoints",
+    "3d_tiles", "orthophoto_tiles", "rtk_analysis",
+    "cameras.json", "images.json", "img_list.txt", "log.json",
+    "options.json", "task_output.txt", "benchmark.txt"
+].join(",");
 
 function buildWorkerStartupScript(){
     // Per-task values are read from sibling metadata keys at boot.
@@ -56,9 +65,11 @@ if [[ -n "\${GCS_PROJECT_ID}" ]]; then
   ARGS+=(--gcs_project_id "\${GCS_PROJECT_ID}")
 fi
 ARGS+=(--gcs_upload_prefix "\${GCS_UPLOAD_PREFIX:-outputs}")
-ARGS+=(--gcs_upload_paths "\${GCS_UPLOAD_PATHS:-.}")
+ARGS+=(--gcs_upload_paths "\${GCS_UPLOAD_PATHS:-${DEFAULT_GCS_UPLOAD_PATHS}}")
 ARGS+=(--gcs_cleanup_after_upload)
-ARGS+=(--gcs_task_archive)
+# ClusterODM builds the download zip on demand from outputs/<name>/, so
+# workers skip the local all.zip build/upload.
+ARGS+=(--gcs_skip_local_archive)
 ARGS+=(--webhook "\${WEBHOOK}")
 ARGS+=(--token "\${NODE_TOKEN}")
 
@@ -84,17 +95,24 @@ module.exports = class GCPAsrProvider extends AbstractASRProvider{
             maxRuntime: 172800,
             maxUploadTime: 7200,
             instanceLimit: 1,
-            createRetries: 3,
+            createRetries: 12,
             imageSizeMapping: [
-                {maxImages: 800, slug: "n2-highmem-16", storage: 500, dockerMemory: "112g"},
-                {maxImages: 5000, slug: "n2-highmem-32", storage: 1000, dockerMemory: "224g"}
+                {maxImages: 800, slug: "c3-highmem-22", storage: 500, dockerMemory: "154g", fallbacks: [
+                    {slug: "n2-highmem-16", dockerMemory: "112g"},
+                    {slug: "n2d-highmem-16", dockerMemory: "112g"}
+                ]},
+                // c3-highmem-44 would be the faster primary here, but it needs
+                // 44 vCPU against a default C3_CPUS regional quota of 24.
+                {maxImages: 5000, slug: "n2-highmem-32", storage: 1000, dockerMemory: "224g", fallbacks: [
+                    {slug: "n2d-highmem-32", dockerMemory: "224g"}
+                ]}
             ],
             gcs: {
                 enabled: true,
                 bucket: "CHANGEME!",
                 projectId: "",
                 uploadPrefix: "outputs",
-                uploadPaths: ".",
+                uploadPaths: DEFAULT_GCS_UPLOAD_PATHS,
                 cleanupAfterUpload: true
             },
             // Internal base for worker --webhook callbacks (private workers
@@ -152,6 +170,11 @@ module.exports = class GCPAsrProvider extends AbstractASRProvider{
             if (!mapping.maxImages || !mapping.slug || !mapping.storage){
                 throw new Error("Each imageSizeMapping entry requires maxImages, slug and storage");
             }
+            (mapping.fallbacks || []).forEach(fallback => {
+                if (!fallback.slug){
+                    throw new Error("Each imageSizeMapping fallback requires a slug");
+                }
+            });
         });
         mappings.sort((a, b) => a.maxImages - b.maxImages);
 
@@ -226,6 +249,39 @@ module.exports = class GCPAsrProvider extends AbstractASRProvider{
         return null;
     }
 
+    /**
+     * Machine types a given job may run on, best first. A fallback inherits
+     * storage/diskType from the primary and overrides only what differs.
+     */
+    getMachineVariantsFor(imagesCount){
+        const base = this.getImagePropertiesFor(imagesCount);
+        if (!base) return [];
+
+        return [base].concat((base.fallbacks || []).map(fallback => {
+            const merged = Object.assign({}, base, fallback);
+            delete merged.fallbacks;
+            return merged;
+        }));
+    }
+
+    /**
+     * Sweep every zone on one machine type before falling back to the next.
+     * Stockouts hit a whole machine family across the region at once, so a
+     * family change finds capacity when another zone won't.
+     */
+    getAttemptPlan(imagesCount, attempt){
+        const variants = this.getMachineVariantsFor(imagesCount);
+        if (!variants.length) throw new Error(`Cannot handle ${imagesCount} images.`);
+
+        const zones = this.getConfigArray("zone");
+        const idx = Math.max(0, attempt - 1);
+        if (!zones.length) throw new Error("Config key zone must be a non-empty array");
+        return {
+            zone: zones[idx % zones.length],
+            image: variants[Math.floor(idx / zones.length) % variants.length]
+        };
+    }
+
     getMaxRuntime(){
         return this.getConfig("maxRuntime", -1);
     }
@@ -261,8 +317,7 @@ module.exports = class GCPAsrProvider extends AbstractASRProvider{
     }
 
     async getInstanceSpec(imagesCount, attempt, hostname, req, token, nodeToken){
-        const image = this.getImagePropertiesFor(imagesCount);
-        const zone = this.getConfigArrayItem("zone", attempt - 1);
+        const {image, zone} = this.getAttemptPlan(imagesCount, attempt);
         const dockerMemory = image.dockerMemory || this.getConfig("dockerMemory", "");
         const serviceAccountEmail = this.getConfig("serviceAccount");
         const emailOnly = serviceAccountEmail.includes("@")
@@ -297,7 +352,7 @@ module.exports = class GCPAsrProvider extends AbstractASRProvider{
             {key: "gcs-bucket", value: this.getConfig("gcs.bucket")},
             {key: "gcs-project-id", value: this.getConfig("gcs.projectId") || ""},
             {key: "gcs-upload-prefix", value: this.getConfig("gcs.uploadPrefix", "outputs")},
-            {key: "gcs-upload-paths", value: this.getConfig("gcs.uploadPaths", ".")},
+            {key: "gcs-upload-paths", value: this.getConfig("gcs.uploadPaths", DEFAULT_GCS_UPLOAD_PATHS)},
             {key: "registry-host", value: this.registryHost()},
             {key: "enable-oslogin", value: "TRUE"}
         ];
@@ -339,10 +394,10 @@ module.exports = class GCPAsrProvider extends AbstractASRProvider{
 
     // Retained for AbstractASRProvider debug helper / non-GCE path compatibility.
     async getCreateArgs(imagesCount, attempt){
-        const image = this.getImagePropertiesFor(imagesCount);
+        const {image, zone} = this.getAttemptPlan(imagesCount, attempt);
         return [
             "--project", this.getConfig("project"),
-            "--zone", this.getConfigArrayItem("zone", attempt - 1),
+            "--zone", zone,
             "--machine-type", image.slug,
             "--disk-size", String(image.storage),
             "--no-address"
@@ -350,26 +405,43 @@ module.exports = class GCPAsrProvider extends AbstractASRProvider{
     }
 
     getFailureSleepTime(attempt){
-        const zones = this.getConfigArray("zone").length;
-        return attempt <= zones ? 1000 : 10000 * (attempt - zones);
+        // Retry immediately while the ladder still has an untried zone/machine
+        // type pair; back off only once the whole matrix has been swept.
+        const variants = this.getConfig("imageSizeMapping", []).reduce(
+            (max, m) => Math.max(max, 1 + (m.fallbacks || []).length), 1);
+        const combinations = this.getConfigArray("zone").length * variants;
+
+        return attempt <= combinations ? 1000 : 10000 * (attempt - combinations);
     }
 
     async destroyMachine(dmHostname){
-        const zones = this.getConfigArray("zone");
+        const project = this.getConfig("project");
+
+        try{
+            const zone = await new GceMachine(dmHostname, {project}).locateZone();
+            if (!zone){
+                logger.warn(`GCE instance ${dmHostname} not found in any zone, nothing to destroy`);
+                return;
+            }
+            await new GceMachine(dmHostname, {project, zone}).rm(true);
+            return;
+        }catch(e){
+            logger.warn(`Could not locate zone for ${dmHostname} (${e.message}), falling back to a per-zone sweep`);
+        }
+
+        // Never force here: a 404 must fall through to the next zone rather
+        // than being reported as a successful delete.
         let lastErr = null;
-        for (const zone of zones){
-            const dm = new GceMachine(dmHostname, {
-                project: this.getConfig("project"),
-                zone
-            });
+        for (const zone of this.getConfigArray("zone")){
             try{
-                await dm.rm(true);
+                await new GceMachine(dmHostname, {project, zone}).rm(false);
                 return;
             }catch(e){
                 lastErr = e;
                 if (/not found|404/i.test(String(e.message || e))) continue;
+                throw e;
             }
         }
-        if (lastErr) throw lastErr;
+        if (lastErr) logger.warn(`GCE instance ${dmHostname} not found in any configured zone`);
     }
 };

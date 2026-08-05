@@ -21,23 +21,39 @@
     "skipFirewallCreate": true,
     "preemptible": false,
     "instanceLimit": 1,
-    "createRetries": 8,
+    "createRetries": 12,
     "maxRuntime": 172800,
     "maxUploadTime": 7200,
     "imageSizeMapping": [
         {
             "maxImages": 800,
-            "slug": "n2-highmem-16",
+            "slug": "c3-highmem-22",
             "storage": 500,
             "diskType": "pd-balanced",
-            "dockerMemory": "112g"
+            "dockerMemory": "154g",
+            "fallbacks": [
+                {
+                    "slug": "n2-highmem-16",
+                    "dockerMemory": "112g"
+                },
+                {
+                    "slug": "n2d-highmem-16",
+                    "dockerMemory": "112g"
+                }
+            ]
         },
         {
             "maxImages": 5000,
             "slug": "n2-highmem-32",
             "storage": 1000,
             "diskType": "pd-balanced",
-            "dockerMemory": "224g"
+            "dockerMemory": "224g",
+            "fallbacks": [
+                {
+                    "slug": "n2d-highmem-32",
+                    "dockerMemory": "224g"
+                }
+            ]
         }
     ],
     "gcs": {
@@ -45,7 +61,7 @@
         "bucket": "asc-nodeodm-outputs-dev",
         "projectId": "asc-consumer-apps-dev",
         "uploadPrefix": "outputs",
-        "uploadPaths": ".",
+        "uploadPaths": "odm_orthophoto,odm_dem,odm_report,odm_georeferencing,odm_meshing,odm_texturing,odm_texturing_25d,odm_filterpoints,3d_tiles,orthophoto_tiles,rtk_analysis,cameras.json,images.json,img_list.txt,log.json,options.json,task_output.txt,benchmark.txt",
         "cleanupAfterUpload": true
     },
     "webhookBaseUrl": "",
