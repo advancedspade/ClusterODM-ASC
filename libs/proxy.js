@@ -40,8 +40,9 @@ const asrProvider = require('./asrProvider');
 const floodMonitor = require('./floodMonitor');
 const concurrencyMonitor = require('./concurrencyMonitor');
 const AWS = require('aws-sdk');
-const {Storage} = require('@google-cloud/storage');
 const ascUiRoutes = require('./ascUiRoutes');
+const {sanitizeProjectName} = require('./gcsProjectName');
+const querystring = require('querystring');
 
 module.exports = {
     initialize: async function(cloudProvider){
@@ -694,44 +695,26 @@ module.exports = {
                                     return;
                                 }
 
-                                // GCP ASR: stream via ADC (no HMAC / SA keys).
+                                // GCP ASR: build the download from outputs/<name>/ on the
+                                // reference node (on-demand zip / single-file stream).
                                 if (gcsConfig && gcsConfig.bucket && provider.getDriverName && provider.getDriverName() === "gce"){
-                                    const storage = new Storage(
-                                        gcsConfig.projectId ? {projectId: gcsConfig.projectId} : undefined
+                                    const job = await jobHistory.lookup(taskId);
+                                    const sanitizedName = sanitizeProjectName(
+                                        (job && job.name) || "",
+                                        taskId
                                     );
-                                    const file = storage.bucket(gcsConfig.bucket).file(key);
-                                    file.getMetadata()
-                                        .then(results => {
-                                            const metadata = results[0] || {};
-                                            if (metadata.contentType) res.setHeader('Content-Type', metadata.contentType);
-                                            if (metadata.size) res.setHeader('Content-Length', metadata.size);
-                                            file.createReadStream()
-                                                .on('error', err => {
-                                                    logger.error(`Error encountered downloading GCS object ${err}`);
-                                                    if (!res.headersSent){
-                                                        res.statusCode = 500;
-                                                        res.end('Internal server error');
-                                                    }else{
-                                                        res.destroy(err);
-                                                    }
-                                                })
-                                                .pipe(res);
-                                        })
-                                        .catch(err => {
-                                            logger.error(`GCS download metadata failed: ${err}`);
-                                            if (!res.headersSent){
-                                                // Only a real missing object is a 404; auth and
-                                                // transport failures must not masquerade as one.
-                                                const status = Number(err && err.code);
-                                                if (status === 404){
-                                                    res.statusCode = 404;
-                                                    res.end('Not found');
-                                                }else{
-                                                    res.statusCode = 500;
-                                                    res.end('Internal server error');
-                                                }
-                                            }
-                                        });
+                                    const qs = Object.assign({}, query);
+                                    let forwardPath;
+                                    if (assetPath === "all.zip"){
+                                        delete qs.path;
+                                        forwardPath = `/gcs/projects/${encodeURIComponent(sanitizedName)}/archive`;
+                                    }else{
+                                        qs.path = assetPath;
+                                        forwardPath = `/gcs/projects/${encodeURIComponent(sanitizedName)}/download`;
+                                    }
+                                    const qsStr = querystring.stringify(qs);
+                                    req.url = qsStr ? `${forwardPath}?${qsStr}` : forwardPath;
+                                    forwardToUiReferenceNode(req, res);
                                     return;
                                 }
 

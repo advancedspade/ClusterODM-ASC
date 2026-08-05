@@ -30,18 +30,30 @@ can fetch orthophoto TMS tiles from `storage.googleapis.com`. Legacy
 - Public GCS outputs bucket accessed with ADC for writes:
   worker SA is `objectAdmin` + `legacyBucketReader`, gateway SA is
   `objectUser` + `legacyBucketReader`.
-- Workers upload both the portal `outputs/<sanitized-name>/` tree and a
-  `<task-uuid>/all.zip` archive (`--gcs_task_archive`) for ClusterODM
-  post-teardown downloads.
+- Workers upload a curated `outputs/<sanitized-name>/` tree (orthophoto, DEM,
+  report, meshes when present, tiles, sidecars). Intermediate `opensfm/` data
+  and the raw `images/`/`gcp/` inputs (already uploaded at task start) are
+  excluded. Workers pass `--gcs_skip_local_archive` so they do **not** build
+  or upload `<task-uuid>/all.zip`.
+- Post-teardown downloads are built on demand by the reference node from
+  `outputs/<sanitized-name>/` (`GET /gcs/projects/<name>/archive`, or
+  `/download?path=` for a single file). ClusterODM resolves the task UUID to
+  that folder name via the job ledger and forwards the request.
 - Worker container logs use `--log-driver=gcplogs` (worker SA has
   `roles/logging.logWriter`).
 
-## Job history
+## Projects view and job history
 
 Routing state is short-lived: a route is dropped when the worker VM is deleted,
 and the task table lives only in memory. A separate ledger at
 `data/jobs.json` on the gateway's mounted volume keeps one durable row per job
 so users still see an outcome after teardown or a gateway restart.
+
+The NodeODM UI exposes a single **Projects** page that lists every folder
+under `outputs/` in the bucket and joins it client-side with
+`GET /task/history` by sanitized project name. Legacy jobs that predate the
+ledger appear as folder-only rows (download / reprocess); tracked jobs show
+status, actors, events, and cancel/delete actions.
 
 - Rows are keyed by task UUID. The creating account's hashed OAuth key
   (`oauth:<sha256(sub)>`) is stored for routing/attribution, and the signed-in
@@ -56,15 +68,19 @@ so users still see an outcome after teardown or a gateway restart.
   can list all jobs via `GET /task/history` and all live task IDs via
   `GET /task/list`. `include_deleted=0` hides deleted history rows.
 - Deleting a job is a soft delete: the row stays and records who removed it.
-  Worker cleanup still runs, and **GCS outputs are preserved** — neither
-  `outputs/<sanitized-name>/` nor `<task-uuid>/all.zip` is touched.
+  Worker cleanup still runs, and **GCS outputs are preserved** —
+  `outputs/<sanitized-name>/` is not touched.
 - Removing or canceling a job whose worker is gone succeeds instead of failing
   with a routing error, and `GET /task/<uuid>/info` falls back to the ledger's
   last known outcome for any signed-in teammate.
+- Reprocess sends `reprocessProject=true` through the gateway to the worker,
+  allows reusing an existing folder name, and clears stale outputs (everything
+  except `images/` and `gcp/`) only after the new run succeeds, right before
+  the fresh upload.
 
 History starts at deploy time; jobs that finished before this ledger existed
-have no row and are not recoverable, though they can still be dismissed from
-the UI.
+have no ledger row, but their `outputs/<name>/` folders still appear in the
+Projects view.
 
 ## Required IaC (Helmut)
 
@@ -88,7 +104,13 @@ Important fields:
 - `zone`: one or more zones; retries rotate through them.
 - `serviceAccount`: service account attached to worker VMs.
 - `machineImage`: COS family (`projects/cos-cloud/global/images/family/cos-stable`).
-- `imageSizeMapping`: first `maxImages` match selects machine/disk size.
+- `imageSizeMapping`: first `maxImages` match selects machine/disk size. Each
+  entry may list `fallbacks`, which inherit the entry's disk settings and
+  override only what differs (typically `slug` and `dockerMemory`). Creation
+  retries sweep every zone on one machine type before moving to the next
+  fallback, because a stockout usually takes out a whole machine family across
+  the region at once. Size `createRetries` to at least `zones × machine types`
+  to give the ladder a full pass.
 - `instanceLimit`: `1` initially.
 - `dockerImage`: NodeODM-ASC image from shared-services Artifact Registry.
 - `gcs.bucket` / `gcs.projectId`: consumer-app public outputs bucket.
@@ -112,9 +134,12 @@ After Helmut apply + gateway deploy:
 2. All three shielded options are enabled on the worker.
 3. Artifact Registry pull succeeds over Private Google Access.
 4. Worker `/commit` lands on the gateway internal IP.
-5. `gs://<bucket>/<uuid>/all.zip` exists.
-6. `gs://<bucket>/outputs/<sanitized-name>/` shape is unchanged.
+5. `gs://<bucket>/<uuid>/all.zip` is **not** created for new jobs.
+6. `gs://<bucket>/outputs/<sanitized-name>/` contains the curated outputs
+   (no `opensfm/`, no duplicate `images/`, no `all.zip`).
 7. Anonymous `GET https://storage.googleapis.com/<bucket>/...` succeeds.
 8. Worker instance is deleted after task completion.
-9. The job appears under Job history with the signing account, and deleting it
-   there keeps the row and leaves the bucket objects in place.
+9. `/task/<uuid>/download/all.zip` streams an on-demand zip built from
+   `outputs/<sanitized-name>/`.
+10. The job appears under Projects with the signing account; deleting it
+    keeps the ledger row and leaves the bucket objects in place.

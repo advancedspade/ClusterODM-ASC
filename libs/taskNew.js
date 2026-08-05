@@ -108,6 +108,7 @@ module.exports = {
             dateCreated: null,
             error: null,
             webhook: "",
+            reprocessProject: false,
             fileNames: [],
             imagesCount: 0
         };
@@ -141,6 +142,11 @@ module.exports = {
 
                 else if (fieldname === 'webhook' && val){
                     params.webhook = val;
+                }
+
+                else if ((fieldname === 'reprocessProject' || fieldname === 'reprocessIncomplete') &&
+                         (val === 'true' || val === '1')){
+                    params.reprocessProject = true;
                 }
             });
         }
@@ -294,7 +300,7 @@ module.exports = {
 
     process: async function(req, res, cloudProvider, uuid, params, token, limits, getLimitedOptions, actor = null){
         const tmpPath = path.join("tmp", uuid);
-        const { options, taskName, skipPostProcessing, outputs, dateCreated, fileNames, imagesCount, webhook } = params;
+        const { options, taskName, skipPostProcessing, outputs, dateCreated, fileNames, imagesCount, webhook, reprocessProject } = params;
 
         if (fileNames.length < 1){
             throw new Error(`Not enough images (${fileNames.length} files uploaded)`);
@@ -426,6 +432,12 @@ module.exports = {
                         body.push({
                             name: 'outputs',
                             contents: outputs
+                        });
+                    }
+                    if (reprocessProject){
+                        body.push({
+                            name: 'reprocessProject',
+                            contents: "true"
                         });
                     }
 
