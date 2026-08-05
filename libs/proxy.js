@@ -694,6 +694,9 @@ module.exports = {
                                     res.end('Bad request');
                                     return;
                                 }
+                                // Traversal-safe relative path (taskId/ stripped). Forward this
+                                // rather than raw assetPath so ../ segments never leave ClusterODM.
+                                const relativePath = key.slice(taskId.length + 1);
 
                                 // GCP ASR: build the download from outputs/<name>/ on the
                                 // reference node (on-demand zip / single-file stream).
@@ -705,11 +708,11 @@ module.exports = {
                                     );
                                     const qs = Object.assign({}, query);
                                     let forwardPath;
-                                    if (assetPath === "all.zip"){
+                                    if (relativePath === "all.zip"){
                                         delete qs.path;
                                         forwardPath = `/gcs/projects/${encodeURIComponent(sanitizedName)}/archive`;
                                     }else{
-                                        qs.path = assetPath;
+                                        qs.path = relativePath;
                                         forwardPath = `/gcs/projects/${encodeURIComponent(sanitizedName)}/download`;
                                     }
                                     const qsStr = querystring.stringify(qs);

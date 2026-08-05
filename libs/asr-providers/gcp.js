@@ -275,7 +275,7 @@ module.exports = class GCPAsrProvider extends AbstractASRProvider{
 
         const zones = this.getConfigArray("zone");
         const idx = Math.max(0, attempt - 1);
-
+        if (!zones.length) throw new Error("Config key zone must be a non-empty array");
         return {
             zone: zones[idx % zones.length],
             image: variants[Math.floor(idx / zones.length) % variants.length]
