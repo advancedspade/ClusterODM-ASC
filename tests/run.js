@@ -24,8 +24,11 @@ async function testRoutes(){
     assert.strictEqual(routes.isPublicUiPath("/auth/google/callback"), true);
     assert.strictEqual(routes.isPublicUiPath("/css/app.css"), true);
     assert.strictEqual(routes.isPublicUiPath("/task/new"), false);
+    assert.strictEqual(routes.isPublicUiPath("/support/feedback"), false);
     assert.strictEqual(routes.isProtectedReferencePath("/gcs/status"), true);
     assert.strictEqual(routes.isProtectedReferencePath("/rtk/run"), true);
+    assert.strictEqual(routes.isProtectedReferencePath("/support/feedback"), true);
+    assert.strictEqual(routes.isProtectedReferencePath("/supportive"), false);
     assert.strictEqual(routes.isProtectedReferencePath("/task/new"), false);
 }
 

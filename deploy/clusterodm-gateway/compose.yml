@@ -29,6 +29,8 @@ services:
       GCS_BUCKET: ${GCS_BUCKET:-}
       GCS_PROJECT_ID: ${GCS_PROJECT_ID:-}
       GCS_UPLOAD_PREFIX: ${GCS_UPLOAD_PREFIX:-outputs}
+      # Shelby Cloud base URL. The UI hides its Feedback buttons when unset.
+      SUPPORT_API_URL: ${SUPPORT_API_URL:-}
     expose:
       - "3000"
     volumes:

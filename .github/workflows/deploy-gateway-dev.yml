@@ -117,9 +117,12 @@ jobs:
           OAUTH_ALLOWED_DOMAINS: ${{ vars.OAUTH_ALLOWED_DOMAINS }}
           REFERENCE_NODE_TOKEN: ${{ secrets.REFERENCE_NODE_TOKEN }}
           CLUSTERODM_ADMIN_PASSWORD: ${{ secrets.CLUSTERODM_ADMIN_PASSWORD }}
+          SUPPORT_API_URL: ${{ vars.SUPPORT_API_URL }}
         run: |
           set -euo pipefail
           GATEWAY_HOSTNAME="${GATEWAY_HOSTNAME:-${GATEWAY_HOSTNAME_DEFAULT}}"
+          # Shelby Cloud base URL for the portal's feedback form.
+          SUPPORT_API_URL="${SUPPORT_API_URL:-https://dev.api.advancedspadecompany.com}"
           # Google Workspace domain of the sign-in accounts, which is not the
           # domain the gateway is served from. ClusterODM reads this env var
           # directly, so a wrong value passes login but 401s every proxied API.
@@ -161,6 +164,7 @@ jobs:
           GCS_BUCKET=${GCS_BUCKET}
           GCS_PROJECT_ID=${GCS_PROJECT_ID}
           GCS_UPLOAD_PREFIX=${GCS_UPLOAD_PREFIX}
+          SUPPORT_API_URL=${SUPPORT_API_URL}
           SESSION_SECRET=${SESSION_SECRET}
           REFERENCE_NODE_TOKEN=${REFERENCE_NODE_TOKEN}
           CLUSTERODM_ADMIN_PASSWORD=${CLUSTERODM_ADMIN_PASSWORD}

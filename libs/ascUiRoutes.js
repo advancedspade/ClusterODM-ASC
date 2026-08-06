@@ -52,6 +52,7 @@ function isProtectedReferencePath(pathname){
     if (!pathname) return false;
     return hasPathPrefix(pathname, "/gcs") ||
            hasPathPrefix(pathname, "/rtk") ||
+           hasPathPrefix(pathname, "/support") ||
            pathname === "/option-ui-defaults";
 }
 
