@@ -1,0 +1,34 @@
+# Local ClusterODM in front of NodeODM on host.docker.internal:4000.
+# Requires a .env next to this file (see .env.example). Compose substitutes
+# ${SESSION_SECRET} from that file; do not put secrets in this YAML.
+# Full setup (both repos, OAuth, GCS): see docs/local-stack.md.
+#
+#   docker compose -f docker-compose.local.yml up --build
+services:
+  clusterodm:
+    build: .
+    ports:
+      - "3000:3000"   # UI/API
+      - "8080:8080"   # admin CLI
+    volumes:
+      - ./docker/data:/var/www/data   # persists jobs.json + archives
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      REFERENCE_NODE_HOST: host.docker.internal
+      REFERENCE_NODE_PORT: "4000"
+      # Must match NODEODM_TOKEN in NodeODM-ASC's docker-compose.dev.yml.
+      REFERENCE_NODE_TOKEN: "local-reference-node-token"
+      # Must match NodeODM-ASC's .env SESSION_SECRET (signs/verifies ndm_oauth JWT).
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in ClusterODM-ASC/.env}
+      OAUTH_ALLOWED_DOMAINS: "aspadeco.com"
+    command:
+      - --cloud-provider
+      - ascOAuth
+      - --session-secret
+      - ${SESSION_SECRET:?Set SESSION_SECRET in ClusterODM-ASC/.env}
+      - --admin-cli-port
+      - "8080"
+      - --admin-web-port
+      - "0"
+      - --no-splitmerge

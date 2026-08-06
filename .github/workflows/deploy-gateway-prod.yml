@@ -164,8 +164,6 @@ jobs:
           OAUTH_GOOGLE_CLIENT_SECRET=${OAUTH_GOOGLE_CLIENT_SECRET}
           OAUTH_ALLOWED_DOMAINS=${OAUTH_ALLOWED_DOMAINS}
           OAUTH_SESSION_DAYS=30
-          PORTAL_STAGING_ENV_LABEL=drone
-          PORTAL_STAGING_ENV_TAGLINE=On-demand processing
           EOF
           sed -i 's/^[[:space:]]*//' .env
           chmod 600 .env

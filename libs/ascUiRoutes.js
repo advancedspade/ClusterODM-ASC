@@ -7,6 +7,7 @@ const PUBLIC_PAGE_PATHS = new Set([
     "/login.html",
     "/home",
     "/uploads",
+    "/projects",
     "/incomplete",
     "/history",
     "/auth/bootstrap"

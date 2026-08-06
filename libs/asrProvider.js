@@ -58,12 +58,16 @@ module.exports = {
         return asrProvider;
     },
 
-    isAllowedToCreateNewNodes: function(){
+    // @param reserved {Number} slots claimed by callers in the same pass that
+    // haven't reached asrProvider.createNode() (and its own pending-creation
+    // counter) yet — lets tryDispatchQueue() fire off multiple queued tasks
+    // without waiting on each one's full VM creation before checking the next.
+    isAllowedToCreateNewNodes: function(reserved = 0){
         if (!asrProvider) return false;
         if (asrProvider.getMachinesLimit() === -1) return true; // no limit
         
         const autoSpawnedNodesCount = nodes.filter(n => n.isAutoSpawned()).length;
-        return (asrProvider.getNodesPendingCreation() + autoSpawnedNodesCount) < asrProvider.getMachinesLimit();
+        return (asrProvider.getNodesPendingCreation() + reserved + autoSpawnedNodesCount) < asrProvider.getMachinesLimit();
     },
 
     canHandle: function(imagesCount){

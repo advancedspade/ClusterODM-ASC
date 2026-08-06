@@ -646,13 +646,30 @@ module.exports = {
                     });
 
                     utils.stringToStream(body).pipe(busboy);
+                }else if (req.method === 'POST' && ['/project/archive', '/project/restore'].indexOf(pathname) !== -1){
+                    const body = querystring.parse(await getReqBody(req));
+                    const requestedName = String(body.name || "").trim();
+                    const projectName = sanitizeProjectName(requestedName, "");
+                    if (!projectName || projectName !== requestedName){
+                        json(res, {error: "Invalid project name"});
+                        return;
+                    }
+
+                    const archived = pathname === '/project/archive';
+                    const project = await jobHistory.setProjectArchived(projectName, archived, actor);
+                    json(res, {
+                        success: !!project,
+                        project
+                    });
                 }else if (req.method === 'GET' && pathname === '/task/history') {
                     const includeDeleted = ['0', 'false'].indexOf(String(query.include_deleted)) === -1;
                     json(res, {
                         jobs: await jobHistory.list({
                             includeDeleted,
                             limit: query.limit
-                        })
+                        }),
+                        archivedProjects: await jobHistory.listArchivedProjects(),
+                        projectArchivesSupported: true
                     });
                 }else if (req.method === 'GET' && pathname === '/task/list') {
                     const taskIds = {};
