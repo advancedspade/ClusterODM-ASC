@@ -282,6 +282,18 @@ async function testJobHistoryLedger(){
     await jobHistory.record("job-4", "restarted", {status: jobHistory.STATUS.RUNNING, allowRevive: true});
     assert.strictEqual((await jobHistory.lookup("job-4")).status, jobHistory.STATUS.RUNNING);
 
+    // Project archives are keyed by GCS folder, not job UUID, so folders that
+    // predate the ledger can be archived and restored too.
+    await jobHistory.setProjectArchived("Legacy_project", true, remover, {at: 1000});
+    await jobHistory.setProjectArchived("North_field", true, remover, {at: 2000});
+    let archivedProjects = await jobHistory.listArchivedProjects();
+    assert.deepStrictEqual(archivedProjects.map(project => project.name), ["North_field", "Legacy_project"]);
+    assert.strictEqual(archivedProjects[0].archivedBy.email, remover.email);
+
+    await jobHistory.setProjectArchived("Legacy_project", false, pilot, {at: 3000});
+    archivedProjects = await jobHistory.listArchivedProjects();
+    assert.deepStrictEqual(archivedProjects.map(project => project.name), ["North_field"]);
+
     // Survives a restart of the gateway.
     await jobHistory.saveToDisk();
     await jobHistory.initialize(file);
@@ -290,6 +302,8 @@ async function testJobHistoryLedger(){
     assert.strictEqual(reloaded.name, "North field");
     assert.strictEqual(reloaded.imagesCount, 120);
     assert.strictEqual((await jobHistory.findByOwner("oauth:owner-a")).length, 4);
+    archivedProjects = await jobHistory.listArchivedProjects();
+    assert.deepStrictEqual(archivedProjects.map(project => project.name), ["North_field"]);
 
     const taskInfo = jobHistory.toTaskInfo(await jobHistory.lookup("job-2"));
     assert.strictEqual(taskInfo.uuid, "job-2");
@@ -299,6 +313,49 @@ async function testJobHistoryLedger(){
     assert.deepStrictEqual(await jobHistory.ownership("job-1", "oauth:owner-a"), {found: true, owned: true});
     assert.deepStrictEqual(await jobHistory.ownership("job-1", "oauth:owner-b"), {found: true, owned: false});
     assert.deepStrictEqual(await jobHistory.ownership("unknown-job", "oauth:owner-a"), {found: false, owned: false});
+}
+
+async function testJobHistoryArchiveMigration(){
+    const jobHistory = require("../libs/jobHistory");
+    const file = tempHistoryFile();
+    fs.writeFileSync(file, JSON.stringify({
+        version: 1,
+        jobs: {
+            "old-failed": {
+                uuid: "old-failed",
+                name: "Same project",
+                status: jobHistory.STATUS.DELETED,
+                createdAt: 100,
+                deletedAt: 150,
+                updatedAt: 150,
+                events: []
+            },
+            "new-success": {
+                uuid: "new-success",
+                name: "Same project",
+                status: jobHistory.STATUS.SUCCEEDED,
+                createdAt: 200,
+                updatedAt: 250,
+                events: []
+            },
+            "legacy-deleted": {
+                uuid: "legacy-deleted",
+                name: "Legacy archived",
+                status: jobHistory.STATUS.DELETED,
+                createdAt: 300,
+                deletedAt: 350,
+                updatedAt: 350,
+                events: []
+            }
+        }
+    }));
+
+    await jobHistory.initialize(file);
+    assert.deepStrictEqual(
+        (await jobHistory.listArchivedProjects()).map(project => project.name),
+        ["Legacy_archived"],
+        "only the newest deleted job for a project should migrate to an archive"
+    );
 }
 
 // Removing a finished job used to fail with "no nodes in routing table" once the
@@ -450,6 +507,7 @@ async function testReferenceNodeTokenRotation(){
     await testStorageObjectKey();
     await testReferenceNodeTokenRotation();
     await testJobHistoryLedger();
+    await testJobHistoryArchiveMigration();
     await testRemoveWithoutRoute();
     console.log("All tests passed");
 

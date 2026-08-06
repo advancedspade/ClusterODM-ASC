@@ -18,7 +18,7 @@
     "useInternalIpOnly": true,
     "skipFirewallCreate": true,
     "preemptible": false,
-    "instanceLimit": 1,
+    "instanceLimit": 3,
     "createRetries": 6,
     "maxRuntime": 172800,
     "maxUploadTime": 7200,
