@@ -22,6 +22,7 @@ const logger = require('./logger');
 const routetable = require('./routetable');
 const async = require('async');
 const URL = require('url').URL;
+const capacityEvents = require('./capacityEvents');
 
 module.exports = {
     publicAddressPath: function(urlPath, req, token){
@@ -56,7 +57,11 @@ module.exports = {
         try{
             if (node.isAutoSpawned() && asr) await asr.destroyNode(node);
             await routetable.removeByNode(node);
-            return nodes.remove(node);
+            const result = nodes.remove(node);
+            // A worker just freed an autoscaling slot; let any locally queued
+            // tasks (see taskNew.js) know it's worth checking for capacity.
+            if (node.isAutoSpawned()) capacityEvents.emit('changed');
+            return result;
         }catch(e){
             logger.warn(`Remove and cleanup failed: ${e.message}`);
             logger.debug(e);

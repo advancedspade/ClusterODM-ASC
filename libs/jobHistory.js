@@ -21,6 +21,7 @@ const fs = require('fs');
 const path = require('path');
 const logger = require('./logger');
 const statusCodes = require('./statusCodes');
+const {sanitizeProjectName} = require('./gcsProjectName');
 
 // Durable job ledger for the gateway. Unlike routetable (routing only, expires)
 // and tasktable (memory only), this survives gateway restarts and worker
@@ -28,8 +29,9 @@ const statusCodes = require('./statusCodes');
 // each event shows who worked on a job.
 
 const DEFAULT_HISTORY_FILE = path.join('data', 'jobs.json');
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const MAX_EVENTS_PER_JOB = 200;
+const MAX_EVENTS_PER_PROJECT = 50;
 
 const STATUS = {
     QUEUED: 'queued',
@@ -53,6 +55,7 @@ const STATUS_RANK = {
 const TERMINAL = [STATUS.SUCCEEDED, STATUS.FAILED, STATUS.CANCELED, STATUS.DELETED];
 
 let jobs = null;
+let projects = null;
 let historyFile = DEFAULT_HISTORY_FILE;
 let writeChain = Promise.resolve();
 
@@ -109,8 +112,20 @@ function newRecord(uuid, ownerKey, now){
     };
 }
 
+function newProjectRecord(name, now){
+    return {
+        name,
+        archived: false,
+        archivedAt: null,
+        archivedBy: null,
+        updatedAt: now,
+        lastUpdatedBy: null,
+        events: []
+    };
+}
+
 function writeNow(){
-    const payload = JSON.stringify({version: SCHEMA_VERSION, jobs});
+    const payload = JSON.stringify({version: SCHEMA_VERSION, jobs, projects});
     const target = historyFile;
     const tmpFile = `${target}.${process.pid}.tmp`;
 
@@ -187,6 +202,22 @@ function toPublic(record){
     };
 }
 
+function projectToPublic(record){
+    return {
+        name: record.name,
+        archived: !!record.archived,
+        archivedAt: record.archivedAt || null,
+        archivedBy: record.archivedBy || null,
+        updatedAt: record.updatedAt || null,
+        lastUpdatedBy: record.lastUpdatedBy || null,
+        events: (record.events || []).map(e => ({
+            at: e.at,
+            action: e.action,
+            actor: e.actor || null
+        }))
+    };
+}
+
 module.exports = {
     STATUS,
 
@@ -211,8 +242,12 @@ module.exports = {
 
     initialize: async function(filePath){
         historyFile = filePath || DEFAULT_HISTORY_FILE;
-        jobs = await this.loadFromDisk();
+        const state = await this.loadFromDisk();
+        jobs = state.jobs;
+        projects = state.projects;
         logger.info(`Loaded ${Object.keys(jobs).length} job history records`);
+        logger.info(`Loaded ${Object.keys(projects).filter(name => projects[name].archived).length} archived projects`);
+        if (state.migrated) await scheduleSave();
     },
 
     statusFromCode,
@@ -315,8 +350,48 @@ module.exports = {
         return limited.map(toPublic);
     },
 
+    setProjectArchived: async function(name, archived, actor, options = {}){
+        if (!projects) return null;
+        const projectName = sanitizeProjectName(name, "");
+        if (!projectName || projectName !== String(name || "").trim()) return null;
+
+        const now = options.at || new Date().getTime();
+        const cleanActor = sanitizeActor(actor);
+        let project = projects[projectName];
+        if (!project){
+            project = newProjectRecord(projectName, now);
+            projects[projectName] = project;
+        }
+
+        project.archived = !!archived;
+        project.archivedAt = project.archived ? now : null;
+        project.archivedBy = project.archived ? cleanActor : null;
+        project.updatedAt = now;
+        project.lastUpdatedBy = cleanActor;
+        project.events.push({
+            at: now,
+            action: project.archived ? 'archived' : 'restored',
+            actor: cleanActor
+        });
+        if (project.events.length > MAX_EVENTS_PER_PROJECT){
+            project.events = project.events.slice(project.events.length - MAX_EVENTS_PER_PROJECT);
+        }
+
+        await scheduleSave();
+        return projectToPublic(project);
+    },
+
+    listArchivedProjects: async function(){
+        if (!projects) return [];
+        return Object.keys(projects)
+            .map(name => projects[name])
+            .filter(project => project.archived)
+            .sort((a, b) => (b.archivedAt || 0) - (a.archivedAt || 0))
+            .map(projectToPublic);
+    },
+
     saveToDisk: async function(){
-        if (!jobs) return;
+        if (!jobs || !projects) return;
         return scheduleSave();
     },
 
@@ -328,19 +403,59 @@ module.exports = {
                 Object.keys(content.jobs).forEach(uuid => {
                     if (!Array.isArray(content.jobs[uuid].events)) content.jobs[uuid].events = [];
                 });
-                return content.jobs;
+                const hasProjects = content.projects && typeof content.projects === 'object';
+                const loadedProjects = hasProjects ? content.projects : {};
+                Object.keys(loadedProjects).forEach(name => {
+                    if (!Array.isArray(loadedProjects[name].events)) loadedProjects[name].events = [];
+                });
+
+                if (!hasProjects){
+                    const newestByProject = {};
+                    Object.keys(content.jobs).forEach(uuid => {
+                        const job = content.jobs[uuid];
+                        const name = sanitizeProjectName(job.name, "");
+                        if (!name) return;
+                        const current = newestByProject[name];
+                        if (!current || (job.createdAt || 0) > (current.createdAt || 0)){
+                            newestByProject[name] = job;
+                        }
+                    });
+                    Object.keys(newestByProject).forEach(name => {
+                        const job = newestByProject[name];
+                        if (job.status !== STATUS.DELETED) return;
+                        const at = job.deletedAt || job.updatedAt || new Date().getTime();
+                        const project = newProjectRecord(name, at);
+                        const actor = sanitizeActor(job.lastUpdatedBy);
+                        project.archived = true;
+                        project.archivedAt = at;
+                        project.archivedBy = actor;
+                        project.lastUpdatedBy = actor;
+                        project.events.push({
+                            at,
+                            action: 'archived',
+                            actor
+                        });
+                        loadedProjects[name] = project;
+                    });
+                }
+
+                return {
+                    jobs: content.jobs,
+                    projects: loadedProjects,
+                    migrated: !hasProjects
+                };
             }
-            return {};
+            return {jobs: {}, projects: {}, migrated: false};
         }catch(err){
             if (err.code !== 'ENOENT'){
                 logger.warn(`Cannot read job history from disk: ${err.message}`);
             }
-            return {};
+            return {jobs: {}, projects: {}, migrated: false};
         }
     },
 
     cleanup: async function(){
-        if (!jobs) return;
+        if (!jobs || !projects) return;
         try{
             await scheduleSave();
             logger.info("Saved job history to disk");

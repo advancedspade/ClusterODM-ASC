@@ -29,12 +29,8 @@ services:
       GCS_BUCKET: ${GCS_BUCKET:-}
       GCS_PROJECT_ID: ${GCS_PROJECT_ID:-}
       GCS_UPLOAD_PREFIX: ${GCS_UPLOAD_PREFIX:-outputs}
-      PORTAL_STAGING_ENV_URL: https://${GATEWAY_HOSTNAME}
-      PORTAL_STAGING_ENV_LABEL: ${PORTAL_STAGING_ENV_LABEL:-cluster dev}
-      PORTAL_STAGING_ENV_TAGLINE: ${PORTAL_STAGING_ENV_TAGLINE:-On-demand processing}
-      PORTAL_SUPER_ENV_URL: ${PORTAL_SUPER_ENV_URL:-}
-      PORTAL_SUPER_ENV_LABEL: ${PORTAL_SUPER_ENV_LABEL:-superdrone}
-      PORTAL_SUPER_ENV_TAGLINE: ${PORTAL_SUPER_ENV_TAGLINE:-Current production}
+      # Shelby Cloud base URL. The UI hides its Feedback buttons when unset.
+      SUPPORT_API_URL: ${SUPPORT_API_URL:-}
     expose:
       - "3000"
     volumes:

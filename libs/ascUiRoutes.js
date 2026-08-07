@@ -7,6 +7,7 @@ const PUBLIC_PAGE_PATHS = new Set([
     "/login.html",
     "/home",
     "/uploads",
+    "/projects",
     "/incomplete",
     "/history",
     "/auth/bootstrap"
@@ -51,6 +52,7 @@ function isProtectedReferencePath(pathname){
     if (!pathname) return false;
     return hasPathPrefix(pathname, "/gcs") ||
            hasPathPrefix(pathname, "/rtk") ||
+           hasPathPrefix(pathname, "/support") ||
            pathname === "/option-ui-defaults";
 }
 

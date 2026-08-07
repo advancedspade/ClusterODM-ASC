@@ -118,10 +118,13 @@ jobs:
           OAUTH_ALLOWED_DOMAINS: ${{ vars.OAUTH_ALLOWED_DOMAINS }}
           REFERENCE_NODE_TOKEN: ${{ secrets.REFERENCE_NODE_TOKEN }}
           CLUSTERODM_ADMIN_PASSWORD: ${{ secrets.CLUSTERODM_ADMIN_PASSWORD }}
+          SUPPORT_API_URL: ${{ vars.SUPPORT_API_URL }}
         run: |
           set -euo pipefail
           GATEWAY_HOSTNAME="${GATEWAY_HOSTNAME:-${GATEWAY_HOSTNAME_DEFAULT}}"
           OAUTH_ALLOWED_DOMAINS="${OAUTH_ALLOWED_DOMAINS:-aspadeco.com}"
+          # Shelby Cloud base URL for the portal's feedback form.
+          SUPPORT_API_URL="${SUPPORT_API_URL:-https://api.advancedspadecompany.com}"
 
           : "${SESSION_SECRET:?SESSION_SECRET is required}"
           : "${OAUTH_GOOGLE_CLIENT_ID:?OAUTH_GOOGLE_CLIENT_ID is required}"
@@ -157,6 +160,7 @@ jobs:
           GCS_BUCKET=${GCS_BUCKET}
           GCS_PROJECT_ID=${GCS_PROJECT_ID}
           GCS_UPLOAD_PREFIX=${GCS_UPLOAD_PREFIX}
+          SUPPORT_API_URL=${SUPPORT_API_URL}
           SESSION_SECRET=${SESSION_SECRET}
           REFERENCE_NODE_TOKEN=${REFERENCE_NODE_TOKEN}
           CLUSTERODM_ADMIN_PASSWORD=${CLUSTERODM_ADMIN_PASSWORD}
@@ -164,8 +168,6 @@ jobs:
           OAUTH_GOOGLE_CLIENT_SECRET=${OAUTH_GOOGLE_CLIENT_SECRET}
           OAUTH_ALLOWED_DOMAINS=${OAUTH_ALLOWED_DOMAINS}
           OAUTH_SESSION_DAYS=30
-          PORTAL_STAGING_ENV_LABEL=drone
-          PORTAL_STAGING_ENV_TAGLINE=On-demand processing
           EOF
           sed -i 's/^[[:space:]]*//' .env
           chmod 600 .env

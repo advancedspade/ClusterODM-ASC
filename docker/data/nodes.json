@@ -1,1 +1,1 @@
-[{"hostname":"nodeodm-1","port":"3000","token":""}]
+[{"hostname":"host.docker.internal","port":4000,"token":"local-reference-node-token","locked":true}]

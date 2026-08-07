@@ -42,18 +42,34 @@ can fetch orthophoto TMS tiles from `storage.googleapis.com`. Legacy
 - Worker container logs use `--log-driver=gcplogs` (worker SA has
   `roles/logging.logWriter`).
 
+## Local task queue
+
+When all `instanceLimit` worker slots are busy, `libs/taskNew.js` holds new
+jobs in an in-memory FIFO queue on the gateway rather than failing with "No
+nodes available". Queued jobs show up with NodeODM status code `10` (Queued)
+in the UI and in `GET /task/<uuid>/info`, and can be canceled/removed like any
+other task. The queue is dispatched:
+
+- immediately after a worker VM is torn down (frees an `instanceLimit` slot),
+- immediately after a failed autoscale attempt (frees a pending-creation slot), and
+- on a 15s safety-net poll, in case neither hook fired.
+
+The queue is in-memory only (like `tasktable`/`routetable`): it does not
+survive a gateway restart, and uploaded files for queued jobs live under
+`tmp/<uuid>/` until they're dispatched or canceled.
+
 ## Projects view and job history
 
 Routing state is short-lived: a route is dropped when the worker VM is deleted,
 and the task table lives only in memory. A separate ledger at
-`data/jobs.json` on the gateway's mounted volume keeps one durable row per job
-so users still see an outcome after teardown or a gateway restart.
+`data/jobs.json` on the gateway's mounted volume keeps durable job rows and
+project archive metadata so both survive teardown and gateway restarts.
 
 The NodeODM UI exposes a single **Projects** page that lists every folder
 under `outputs/` in the bucket and joins it client-side with
 `GET /task/history` by sanitized project name. Legacy jobs that predate the
 ledger appear as folder-only rows (download / reprocess); tracked jobs show
-status, actors, events, and cancel/delete actions.
+status, actors, and events.
 
 - Rows are keyed by task UUID. The creating account's hashed OAuth key
   (`oauth:<sha256(sub)>`) is stored for routing/attribution, and the signed-in
@@ -67,9 +83,10 @@ status, actors, events, and cancel/delete actions.
 - This is an internal tool: any authenticated user (domain-restricted OAuth)
   can list all jobs via `GET /task/history` and all live task IDs via
   `GET /task/list`. `include_deleted=0` hides deleted history rows.
-- Deleting a job is a soft delete: the row stays and records who removed it.
-  Worker cleanup still runs, and **GCS outputs are preserved** —
-  `outputs/<sanitized-name>/` is not touched.
+- Archiving is keyed by sanitized GCS folder name rather than task UUID, so it
+  works for every project, including folders created before the job ledger.
+  Archive and restore actions are persisted in `data/jobs.json`; neither action
+  changes **GCS outputs** under `outputs/<sanitized-name>/`.
 - Removing or canceling a job whose worker is gone succeeds instead of failing
   with a routing error, and `GET /task/<uuid>/info` falls back to the ledger's
   last known outcome for any signed-in teammate.
@@ -111,7 +128,12 @@ Important fields:
   fallback, because a stockout usually takes out a whole machine family across
   the region at once. Size `createRetries` to at least `zones × machine types`
   to give the ladder a full pass.
-- `instanceLimit`: `1` initially.
+- `instanceLimit`: max concurrent worker VMs (`3`). Jobs submitted beyond this
+  limit are held in an in-memory FIFO queue on the gateway (see below) instead
+  of being rejected, and are dispatched to a worker as soon as one frees up.
+  Raising this further is a quota question as much as a config one — check the
+  project's regional CPU quota for the machine families in `imageSizeMapping`
+  (each `c3-highmem-22` worker alone needs 22 vCPUs of `C3_CPUS`).
 - `dockerImage`: NodeODM-ASC image from shared-services Artifact Registry.
 - `gcs.bucket` / `gcs.projectId`: consumer-app public outputs bucket.
 - `webhookBaseUrl`: filled on the gateway at deploy time
