@@ -36,6 +36,8 @@ offline:
    GCS_BUCKET=asc-nodeodm-outputs-dev
    GCS_PROJECT_ID=asc-consumer-apps-dev
    GCS_UPLOAD_PREFIX=outputs
+   # Optional, to enable the Feedback form (submits real tickets to dev Shelby):
+   SUPPORT_API_URL=https://dev.api.advancedspadecompany.com
    ```
 
    The redirect URI points at the gateway (port 3000), and that exact URL must be
@@ -77,7 +79,25 @@ Open http://localhost:3000 and sign in with an `@aspadeco.com` Google account.
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/login.html          # 200
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/task/history         # 401 (no cookie) is expected
 curl -s -o /dev/null -w '%{http_code}\n' 'http://localhost:4000/info?token=local-reference-node-token'  # 200
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:3000/support/feedback  # 401 (no cookie) is expected
 ```
+
+## Feedback form
+
+With `SUPPORT_API_URL` set, NodeODM exposes `POST /support/feedback` and the UI
+shows a Feedback button in the sidebar footer and in the Projects toolbar. The
+browser never calls Shelby directly: NodeODM forwards server-side to
+`${SUPPORT_API_URL}/support/feedback/public`, substituting the signed-in Google
+email for whatever the client sent.
+
+Point `SUPPORT_API_URL` at a local stub instead of dev Shelby if you don't want
+real tickets and emails:
+
+```bash
+SUPPORT_API_URL=http://host.docker.internal:8099
+```
+
+Leave `SUPPORT_API_URL` unset to hide both buttons.
 
 ## Troubleshooting
 
@@ -93,6 +113,9 @@ curl -s -o /dev/null -w '%{http_code}\n' 'http://localhost:4000/info?token=local
   client. Use `localhost` consistently (not `127.0.0.1`).
 - **Login loops / cookie dropped after callback.** Local origins are http, so the
   cookie can't be `Secure`; `docker-compose.dev.yml` sets `OAUTH_COOKIE_SECURE=0`.
+- **No Feedback button.** `SUPPORT_API_URL` is unset on the NodeODM container.
+  `/auth/bootstrap` reports `feedback.enabled`, and the UI hides both entry
+  points when it is false.
 - **"Cloud storage is not connected."** ADC expired — re-run
   `gcloud auth application-default login` and recreate the NodeODM container with
   `--force-recreate`.
