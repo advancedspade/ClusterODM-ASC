@@ -28,6 +28,7 @@ const os = require('os');
 const path = require('path');
 
 const tmpUploadsMap = {}; // tmp dir entries --> number of files
+const DEFAULT_TMP_MAX_AGE_HOURS = 48;
 
 module.exports = {
 	get: function(scope, prop, defaultValue){
@@ -77,72 +78,94 @@ module.exports = {
         }
     },
 
-    cleanupTemporaryDirectory: async function(staleUploadsTimeout = 0){
+    /**
+     * Deletes abandoned uploads from tmp/. Two independent rules, both in hours:
+     * `staleUploadsTimeout` (no new files for that long) and `maxAgeHours` (hard
+     * cap on directory age, which is also the resume window).
+     *
+     * Both defer to the job ledger, because tmpUploadsMap lives only in memory:
+     * after a restart it cannot tell a committed upload from an abandoned one, and
+     * deleting a committed-but-not-yet-dispatched upload loses the user's work.
+     */
+    cleanupTemporaryDirectory: async function(staleUploadsTimeout = 0, maxAgeHours = DEFAULT_TMP_MAX_AGE_HOURS){
         const self = this;
+        const jobHistory = require('./jobHistory');
+
+        const hardExpiry = 1000 * 60 * 60 * ((parseInt(maxAgeHours, 10) > 0) ? parseInt(maxAgeHours, 10) : DEFAULT_TMP_MAX_AGE_HOURS);
 
         return new Promise((resolve, reject) => {
             fs.readdir('tmp', async (err, entries) => {
-                if (err) reject(err);
-                else{
-                    for (let entry of entries){
-                        if (entry === '.gitignore') continue;
-
-                        let stale = false;
-                        let tmpPath = path.join('tmp', entry);
-
-                        if (staleUploadsTimeout > 0){
-                            try{
-                                const fileCount = await self.filesCount(tmpPath);
-    
-                                if (tmpUploadsMap[entry] === undefined){
-                                    tmpUploadsMap[entry] = {
-                                        fileCount, 
-                                        lastUpdated: new Date().getTime(),
-                                        committed: false
-                                    };
-                                }else{
-                                    const prevFileCount = tmpUploadsMap[entry].fileCount;
-                                    stale = !tmpUploadsMap[entry].committed && 
-                                            prevFileCount === fileCount && 
-                                            (new Date().getTime() - tmpUploadsMap[entry].lastUpdated > 1000 * 60 * 60 * staleUploadsTimeout);
-
-                                    // Update if the count has changed
-                                    if (prevFileCount !== fileCount){
-                                        tmpUploadsMap[entry].fileCount = fileCount;
-                                        tmpUploadsMap[entry].lastUpdated = new Date().getTime();
-                                    }
-                                }
-                            }catch(e){
-                                logger.error(e);
-                            }
-                        }
-                        
-                        // This is async, it will not block!
-                        fs.stat(tmpPath, function(err, stats){
-                            if (err) logger.error(err);
-                            else{
-                                const mtime = new Date(stats.mtime);
-                                if (stale || (new Date().getTime() - mtime.getTime() > 1000 * 60 * 60 * 48)){
-                                    logger.info("Cleaning up " + entry + " " + (stale ? "[stale]" : ""));
-                                    self.rmfr(tmpPath, err => {
-                                        if (err) logger.error(err);
-                                    });
-                                    delete (tmpUploadsMap[entry]);
-                                }
-                            }
-                        });
-                    }
-                    
-                    // Remove entries in the upload map that aren't in tmp dir
-                    // to avoid memory leaks
-                    for (let entry of Object.keys(tmpUploadsMap)){
-                        if (entries.indexOf(entry) === -1){
-                            delete (tmpUploadsMap[entry]);
-                        }
-                    }
-
-                    resolve();
+                if (err){
+                    reject(err);
+                    return;
                 }
+
+                for (let entry of entries){
+                    if (entry === '.gitignore') continue;
+
+                    let stale = false;
+                    let tmpPath = path.join('tmp', entry);
+
+                    // A dispatch is reading these files right now; deleting them
+                    // would fail a running job.
+                    if (await jobHistory.hasActiveDispatch(entry)) continue;
+
+                    const job = await jobHistory.lookup(entry);
+                    const resumable = !!job && !jobHistory.isTerminal(job.status);
+
+                    if (staleUploadsTimeout > 0 && !resumable){
+                        try{
+                            const fileCount = await self.filesCount(tmpPath);
+
+                            if (tmpUploadsMap[entry] === undefined){
+                                tmpUploadsMap[entry] = {
+                                    fileCount,
+                                    lastUpdated: new Date().getTime(),
+                                    committed: false
+                                };
+                            }else{
+                                const prevFileCount = tmpUploadsMap[entry].fileCount;
+                                stale = !tmpUploadsMap[entry].committed &&
+                                        prevFileCount === fileCount &&
+                                        (new Date().getTime() - tmpUploadsMap[entry].lastUpdated > 1000 * 60 * 60 * staleUploadsTimeout);
+
+                                // Update if the count has changed
+                                if (prevFileCount !== fileCount){
+                                    tmpUploadsMap[entry].fileCount = fileCount;
+                                    tmpUploadsMap[entry].lastUpdated = new Date().getTime();
+                                }
+                            }
+                        }catch(e){
+                            logger.error(e);
+                        }
+                    }
+
+                    // This is async, it will not block!
+                    fs.stat(tmpPath, function(err, stats){
+                        if (err) logger.error(err);
+                        else{
+                            const mtime = new Date(stats.mtime);
+                            const expired = new Date().getTime() - mtime.getTime() > hardExpiry;
+                            if (stale || expired){
+                                logger.info(`Cleaning up ${entry} ${stale ? "[stale]" : "[expired]"}`);
+                                self.rmfr(tmpPath, err => {
+                                    if (err) logger.error(err);
+                                });
+                                delete (tmpUploadsMap[entry]);
+                            }
+                        }
+                    });
+                }
+
+                // Remove entries in the upload map that aren't in tmp dir
+                // to avoid memory leaks
+                for (let entry of Object.keys(tmpUploadsMap)){
+                    if (entries.indexOf(entry) === -1){
+                        delete (tmpUploadsMap[entry]);
+                    }
+                }
+
+                resolve();
             });
         })
     },

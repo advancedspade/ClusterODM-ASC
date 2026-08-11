@@ -29,7 +29,7 @@ const {sanitizeProjectName} = require('./gcsProjectName');
 // each event shows who worked on a job.
 
 const DEFAULT_HISTORY_FILE = path.join('data', 'jobs.json');
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const MAX_EVENTS_PER_JOB = 200;
 const MAX_EVENTS_PER_PROJECT = 50;
 
@@ -41,6 +41,24 @@ const STATUS = {
     CANCELED: 'canceled',
     DELETED: 'deleted'
 };
+
+// Where a commit is in the hand-off to a worker. Persisted because the gateway
+// can restart mid-dispatch, and an in-memory-only guard would then let a client
+// retry start a second worker VM for the same upload.
+const DISPATCH_PHASE = {
+    ACCEPTED: 'accepted',
+    QUEUED: 'queued',
+    DISPATCHING: 'dispatching',
+    ROUTED: 'routed'
+};
+
+// A phase in this set means "a dispatch owns this upload right now", which both
+// blocks a duplicate commit and protects tmp/<uuid> from cleanup.
+const ACTIVE_DISPATCH_PHASES = [
+    DISPATCH_PHASE.ACCEPTED,
+    DISPATCH_PHASE.QUEUED,
+    DISPATCH_PHASE.DISPATCHING
+];
 
 // Ordering used by applyStatus to decide which transitions are allowed.
 const STATUS_RANK = {
@@ -108,6 +126,8 @@ function newRecord(uuid, ownerKey, now){
         deletedAt: null,
         createdBy: null,
         lastUpdatedBy: null,
+        dispatchPhase: null,
+        dispatchAcceptedAt: null,
         events: []
     };
 }
@@ -179,6 +199,14 @@ function applyStatus(record, status, options = {}){
     return true;
 }
 
+function isActivePhase(phase){
+    return ACTIVE_DISPATCH_PHASES.indexOf(phase) !== -1;
+}
+
+function isTerminal(status){
+    return TERMINAL.indexOf(status) !== -1;
+}
+
 function toPublic(record){
     return {
         uuid: record.uuid,
@@ -220,6 +248,136 @@ function projectToPublic(record){
 
 module.exports = {
     STATUS,
+    DISPATCH_PHASE,
+
+    /**
+     * Claims the right to dispatch `uuid`, so a retried commit is a no-op that
+     * returns the original task instead of launching a second worker.
+     *
+     * The read-modify-write below runs without an await, which is what makes it
+     * atomic against concurrent requests on Node's single thread; the disk write
+     * it schedules is serialized by writeChain as usual.
+     *
+     * @return {object} {accepted, reason, revived, job}
+     */
+    tryAcceptCommit: function(uuid, options = {}){
+        if (!uuid || !jobs) return {accepted: true, reason: null, revived: false, job: null};
+
+        const now = options.at || new Date().getTime();
+        const job = jobs[uuid];
+
+        if (job){
+            if (isActivePhase(job.dispatchPhase)){
+                return {accepted: false, reason: 'in-progress', revived: false, job};
+            }
+            if (job.dispatchPhase === DISPATCH_PHASE.ROUTED){
+                return {accepted: false, reason: 'routed', revived: false, job};
+            }
+            if (job.status === STATUS.DELETED || job.status === STATUS.CANCELED){
+                return {accepted: false, reason: job.status, revived: false, job};
+            }
+            if (job.status === STATUS.SUCCEEDED){
+                return {accepted: false, reason: 'succeeded', revived: false, job};
+            }
+        }
+
+        // A job the orphan sweeper already failed is still resumable as long as
+        // its uploaded files survived, so accept and let the caller revive it.
+        const revived = !!job && job.status === STATUS.FAILED;
+
+        const target = job || newRecord(uuid, options.ownerKey, now);
+        if (!job) jobs[uuid] = target;
+
+        target.dispatchPhase = DISPATCH_PHASE.ACCEPTED;
+        target.dispatchAcceptedAt = now;
+        target.updatedAt = now;
+
+        scheduleSave();
+
+        return {accepted: true, reason: null, revived, job: target};
+    },
+
+    setDispatchPhase: async function(uuid, phase){
+        if (!uuid || !jobs) return null;
+        const job = jobs[uuid];
+        if (!job) return null;
+
+        job.dispatchPhase = phase || null;
+        if (!phase) job.dispatchAcceptedAt = null;
+        job.updatedAt = new Date().getTime();
+        scheduleSave();
+        return job;
+    },
+
+    clearDispatchPhase: async function(uuid){
+        return this.setDispatchPhase(uuid, null);
+    },
+
+    /**
+     * Drops dispatch claims left behind by a gateway that died mid-hand-off.
+     * Without this, a persisted `accepted` phase would reject every retry and
+     * every resume attempt forever, turning the idempotency guard into a trap.
+     *
+     * @param isLive {function} async (uuid) => bool, true while a dispatch is
+     *                          genuinely still running for that task.
+     */
+    clearStaleDispatchPhases: async function(isLive){
+        if (!jobs) return [];
+
+        const cleared = [];
+        for (const uuid of Object.keys(jobs)){
+            const job = jobs[uuid];
+            if (!isActivePhase(job.dispatchPhase)) continue;
+            if (await isLive(uuid)) continue;
+
+            job.dispatchPhase = null;
+            job.dispatchAcceptedAt = null;
+            cleared.push(uuid);
+        }
+
+        if (cleared.length) scheduleSave();
+        return cleared;
+    },
+
+    /**
+     * True while tmp/<uuid> must survive cleanup because a dispatch is actively
+     * reading those files. Kept here so cleanup does not have to know the
+     * dispatch-phase vocabulary.
+     */
+    hasActiveDispatch: async function(uuid){
+        const job = await this.lookup(uuid);
+        return !!job && isActivePhase(job.dispatchPhase);
+    },
+
+    isTerminal: function(status){
+        return isTerminal(status);
+    },
+
+    /**
+     * Raw records that have not reached an outcome yet. Used by the orphan
+     * sweeper, which needs dispatchPhase and events that toPublic() hides.
+     */
+    listNonTerminal: async function(){
+        if (!jobs) return [];
+        return Object.keys(jobs)
+            .map(uuid => jobs[uuid])
+            .filter(job => !isTerminal(job.status));
+    },
+
+    /**
+     * Last known worker for a job, as "hostname:port", recovered from the
+     * `routed` event. Lets the sweeper probe a worker whose route was dropped.
+     */
+    lastNodeHint: function(job){
+        if (!job || !Array.isArray(job.events)) return null;
+        for (let i = job.events.length - 1; i >= 0; i--){
+            const event = job.events[i];
+            if (event.action !== 'routed' || !event.detail) continue;
+            const match = String(event.detail).match(/^([^\s:]+):(\d+)$/);
+            if (match) return {hostname: match[1], port: parseInt(match[2], 10)};
+        }
+        return null;
+    },
 
     /**
      * Last known state in the shape NodeODM clients expect, so a task whose
@@ -287,6 +445,13 @@ module.exports = {
             else{
                 const derived = codeFromStatus(job.status);
                 if (derived !== null) job.statusCode = derived;
+            }
+
+            // Reaching an outcome ends the hand-off, so no claim is left to
+            // block a future commit for this uuid.
+            if (isTerminal(job.status)){
+                job.dispatchPhase = null;
+                job.dispatchAcceptedAt = null;
             }
         }
 
@@ -401,7 +566,10 @@ module.exports = {
             const content = JSON.parse(raw);
             if (content && content.jobs && typeof content.jobs === 'object'){
                 Object.keys(content.jobs).forEach(uuid => {
-                    if (!Array.isArray(content.jobs[uuid].events)) content.jobs[uuid].events = [];
+                    const job = content.jobs[uuid];
+                    if (!Array.isArray(job.events)) job.events = [];
+                    if (job.dispatchPhase === undefined) job.dispatchPhase = null;
+                    if (job.dispatchAcceptedAt === undefined) job.dispatchAcceptedAt = null;
                 });
                 const hasProjects = content.projects && typeof content.projects === 'object';
                 const loadedProjects = hasProjects ? content.projects : {};

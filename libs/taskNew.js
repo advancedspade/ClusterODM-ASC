@@ -61,7 +61,7 @@ const getUuid = async (req) => {
         const userUuid = req.headers['set-uuid'];
         
         // Valid UUID and no other task with same UUID?
-        console.log(userUuid);
+        logger.debug(`Client requested set-uuid ${userUuid}`);
         if (utils.isTaskUuid(userUuid)){
             if (await tasktable.lookup(userUuid)){
                 throw new Error(`Invalid set-uuid: ${userUuid}`);
@@ -353,6 +353,14 @@ module.exports = {
     _dispatch: async function({ node, autoscale, req, res, uuid, tmpPath, params, token, limits, getLimitedOptions, actor }){
         const { options, taskName, skipPostProcessing, outputs, dateCreated, fileNames, imagesCount, webhook, reprocessProject } = params;
 
+        await jobHistory.setDispatchPhase(uuid, jobHistory.DISPATCH_PHASE.DISPATCHING);
+        logger.event('task.dispatch.start', {
+            taskId: uuid,
+            imagesCount,
+            autoscale: !!autoscale,
+            node: String(node)
+        });
+
         // Validate options
         // Will throw an exception on failure
         let taskOptions = odmOptions.filterOptions(this.augmentTaskOptions(req, options, limits, token), 
@@ -566,6 +574,13 @@ module.exports = {
                 status: jobHistory.STATUS.FAILED,
                 detail: err.message
             });
+            logger.event('task.failed', {
+                taskId: uuid,
+                imagesCount,
+                node: String(node),
+                actor: actor && actor.email,
+                detail: err.message
+            });
             utils.rmdir(tmpPath);
             eventEmitter.emit('close');
         };
@@ -587,6 +602,12 @@ module.exports = {
                 if (retries < MAX_UPLOAD_RETRIES){
                     retries++;
                     logger.warn(`Attempted to forward task ${uuid} to processing node ${node} but failed with: ${e.message}, attempting again (retry: ${retries})`);
+                    logger.event('task.forward.retry', {
+                        taskId: uuid,
+                        attempt: retries,
+                        node: String(node),
+                        detail: e.message
+                    });
                     await utils.sleep(1000 * 5 * retries);
 
                     // If autoscale is enabled, simply retry on same node
@@ -631,6 +652,12 @@ module.exports = {
                 node = await asr.createNode(req, imagesCount, token, dmHostname, status);
                 if (!status.aborted) nodes.add(node);
                 else return;
+                logger.event('task.dispatch.node', {
+                    taskId: uuid,
+                    imagesCount,
+                    node: String(node),
+                    hostname: dmHostname
+                });
             }catch(e){
                 const err = new Error("No nodes available (attempted to autoscale but failed). Try again later.");
                 logger.warn(`Cannot create node via autoscaling: ${e.message}`);
@@ -652,6 +679,13 @@ module.exports = {
                 actor,
                 status: jobHistory.STATUS.RUNNING,
                 detail: String(node)
+            });
+            await jobHistory.setDispatchPhase(uuid, jobHistory.DISPATCH_PHASE.ROUTED);
+            logger.event('task.routed', {
+                taskId: uuid,
+                imagesCount,
+                node: String(node),
+                actor: actor && actor.email
             });
 
             utils.rmdir(tmpPath);
@@ -701,6 +735,13 @@ module.exports = {
             imagesCount,
             status: jobHistory.STATUS.QUEUED,
             detail: "Waiting for available processing capacity"
+        });
+        await jobHistory.setDispatchPhase(uuid, jobHistory.DISPATCH_PHASE.QUEUED);
+        logger.event('task.queued', {
+            taskId: uuid,
+            imagesCount,
+            position: queuedTasks.length,
+            actor: actor && actor.email
         });
 
         if (res) utils.json(res, { uuid });
@@ -767,6 +808,11 @@ module.exports = {
                         ownerKey: head.token,
                         actor: head.actor,
                         status: jobHistory.STATUS.FAILED,
+                        detail: e.message
+                    });
+                    logger.event('task.failed', {
+                        taskId: head.uuid,
+                        imagesCount: head.params && head.params.imagesCount,
                         detail: e.message
                     });
                     utils.rmdir(head.tmpPath);

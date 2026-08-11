@@ -495,6 +495,190 @@ async function testRemoveWithoutRoute(){
     }
 }
 
+// The enabling fix for the lost-commit incident: a client that never saw the
+// response must be able to POST the same commit again without starting a second
+// run, and a gateway that died mid-dispatch must not leave the uuid locked.
+async function testCommitIdempotency(){
+    const jobHistory = require("../libs/jobHistory");
+    const uuid = "44444444-4444-4444-8444-444444444444";
+    await jobHistory.initialize(tempHistoryFile());
+
+    await jobHistory.record(uuid, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
+
+    const first = jobHistory.tryAcceptCommit(uuid, {ownerKey: "owner-a"});
+    assert.strictEqual(first.accepted, true);
+    assert.strictEqual((await jobHistory.lookup(uuid)).dispatchPhase, jobHistory.DISPATCH_PHASE.ACCEPTED);
+
+    const second = jobHistory.tryAcceptCommit(uuid, {ownerKey: "owner-a"});
+    assert.strictEqual(second.accepted, false, "a retried commit must not claim the task twice");
+    assert.strictEqual(second.reason, "in-progress");
+
+    await jobHistory.setDispatchPhase(uuid, jobHistory.DISPATCH_PHASE.ROUTED);
+    assert.strictEqual(jobHistory.tryAcceptCommit(uuid).reason, "routed");
+
+    // A gateway that restarts mid-dispatch must release the claim, or every
+    // retry and every resume would be swallowed as "already accepted" forever.
+    await jobHistory.setDispatchPhase(uuid, jobHistory.DISPATCH_PHASE.DISPATCHING);
+    assert.deepStrictEqual(await jobHistory.clearStaleDispatchPhases(async () => true), [],
+                           "a live dispatch must keep its claim");
+    assert.deepStrictEqual(await jobHistory.clearStaleDispatchPhases(async () => false), [uuid]);
+    assert.strictEqual(jobHistory.tryAcceptCommit(uuid).accepted, true, "resume must work after a restart");
+
+    // Reaching an outcome releases the claim on its own.
+    await jobHistory.record(uuid, "finished", {statusCode: statusCodesFor("COMPLETED"), force: true});
+    assert.strictEqual((await jobHistory.lookup(uuid)).dispatchPhase, null);
+    assert.strictEqual(jobHistory.tryAcceptCommit(uuid).reason, "succeeded");
+
+    // A swept orphan stays resumable while its uploaded files exist.
+    const swept = "55555555-5555-4555-8555-555555555555";
+    await jobHistory.record(swept, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
+    await jobHistory.record(swept, "failed", {
+        status: jobHistory.STATUS.FAILED,
+        detail: "orphaned - gateway lost track of this task"
+    });
+    const revive = jobHistory.tryAcceptCommit(swept, {ownerKey: "owner-a"});
+    assert.strictEqual(revive.accepted, true);
+    assert.strictEqual(revive.revived, true, "a swept upload must be resumable");
+
+    // Deleting or canceling is final; committing again must not resurrect it.
+    const dropped = "66666666-6666-4666-8666-666666666666";
+    await jobHistory.record(dropped, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
+    await jobHistory.record(dropped, "deleted", {status: jobHistory.STATUS.DELETED});
+    assert.strictEqual(jobHistory.tryAcceptCommit(dropped).reason, jobHistory.STATUS.DELETED);
+}
+
+function statusCodesFor(name){
+    return require("../libs/statusCodes")[name];
+}
+
+// The sweeper is the thing that stops "In progress forever", but it can also
+// destroy a good job's record, so its two guards are worth pinning down.
+async function testOrphanSweeper(){
+    const jobHistory = require("../libs/jobHistory");
+    const reconcile = require("../libs/reconcile");
+    const routetable = require("../libs/routetable");
+    const tasktable = require("../libs/tasktable");
+    const statusCodes = require("../libs/statusCodes");
+
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "clusterodm-sweep-"));
+    fs.mkdirSync(path.join(workDir, "data"));
+    const originalCwd = process.cwd();
+    const originalTimeout = config.orphan_timeout;
+    process.chdir(workDir);
+    config.orphan_timeout = 1;
+
+    // Stands in for a worker whose route the gateway lost.
+    const worker = http.createServer((req, res) => {
+        res.writeHead(200, {"Content-Type": "application/json"});
+        res.end(JSON.stringify({uuid: "x", status: {code: statusCodes.RUNNING}}));
+    });
+
+    try{
+        await new Promise(resolve => worker.listen(0, "127.0.0.1", resolve));
+        const workerPort = worker.address().port;
+
+        await jobHistory.initialize(path.join("data", "jobs.json"));
+        await routetable.initialize();
+        await tasktable.initialize();
+
+        const twoHoursAgo = new Date().getTime() - 1000 * 60 * 60 * 2;
+        const stale = (uuid) => jobHistory.record(uuid, "created", {
+            ownerKey: "owner-a",
+            status: jobHistory.STATUS.QUEUED,
+            at: twoHoursAgo
+        });
+
+        const lost = "77777777-7777-4777-8777-777777777777";
+        const dispatching = "88888888-8888-4888-8888-888888888888";
+        const routed = "99999999-9999-4999-8999-999999999999";
+        const alive = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        const fresh = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+        await stale(lost);
+        await stale(dispatching);
+        await stale(routed);
+        await stale(alive);
+        await jobHistory.record(fresh, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
+
+        await tasktable.add(dispatching, {taskInfo: {uuid: dispatching}}, "owner-a");
+        await routetable.add(routed, new Node("127.0.0.1", workerPort), "owner-a");
+
+        // Route was dropped, but the worker is still there and must be believed
+        // over the empty routing table.
+        await jobHistory.record(alive, "routed", {
+            status: jobHistory.STATUS.RUNNING,
+            detail: `127.0.0.1:${workerPort}`,
+            at: twoHoursAgo
+        });
+
+        const result = await reconcile.sweep();
+        assert.strictEqual(result.orphaned, 1, `expected exactly one orphan, got ${JSON.stringify(result)}`);
+
+        assert.strictEqual((await jobHistory.lookup(lost)).status, jobHistory.STATUS.FAILED);
+        assert.ok((await jobHistory.lookup(lost)).events.some(e => /orphaned/.test(e.detail || "")));
+        assert.strictEqual((await jobHistory.lookup(dispatching)).status, jobHistory.STATUS.QUEUED,
+                           "a live dispatch must be left alone");
+        assert.strictEqual((await jobHistory.lookup(routed)).status, jobHistory.STATUS.QUEUED,
+                           "a job with a live route must be left alone");
+        assert.strictEqual((await jobHistory.lookup(alive)).status, jobHistory.STATUS.RUNNING,
+                           "a reachable worker must heal the ledger, not fail it");
+        assert.strictEqual((await jobHistory.lookup(fresh)).status, jobHistory.STATUS.QUEUED,
+                           "a job younger than the threshold must be left alone");
+    }finally{
+        await new Promise(resolve => worker.close(resolve));
+        process.chdir(originalCwd);
+        config.orphan_timeout = originalTimeout;
+    }
+}
+
+// Cleanup used to delete a committed upload after a restart, because the
+// "committed" flag it consulted only ever lived in memory.
+async function testLedgerAwareCleanup(){
+    const jobHistory = require("../libs/jobHistory");
+    const utils = require("../libs/utils");
+
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "clusterodm-cleanup-"));
+    fs.mkdirSync(path.join(workDir, "data"));
+    fs.mkdirSync(path.join(workDir, "tmp"));
+    const originalCwd = process.cwd();
+    process.chdir(workDir);
+
+    try{
+        await jobHistory.initialize(path.join("data", "jobs.json"));
+
+        const committed = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        const abandoned = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        const old = new Date(new Date().getTime() - 1000 * 60 * 60 * 24);
+
+        for (const uuid of [committed, abandoned]){
+            const dir = path.join("tmp", uuid);
+            fs.mkdirSync(dir);
+            fs.writeFileSync(path.join(dir, "body.json"), "{}");
+            fs.utimesSync(dir, old, old);
+        }
+
+        await jobHistory.record(committed, "uploaded", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
+        jobHistory.tryAcceptCommit(committed, {ownerKey: "owner-a"});
+
+        await utils.cleanupTemporaryDirectory(0, 1);
+        await new Promise(resolve => setTimeout(resolve, 500));
+
+        assert.ok(fs.existsSync(path.join("tmp", committed)),
+                  "an upload with an active dispatch must survive cleanup");
+        assert.ok(!fs.existsSync(path.join("tmp", abandoned)),
+                  "an aged-out upload with no ledger row must be removed");
+
+        // Once the job settles, its files are fair game again.
+        await jobHistory.record(committed, "failed", {status: jobHistory.STATUS.FAILED, detail: "gave up"});
+        await utils.cleanupTemporaryDirectory(0, 1);
+        await new Promise(resolve => setTimeout(resolve, 500));
+        assert.ok(!fs.existsSync(path.join("tmp", committed)),
+                  "a settled job's upload must be removed once it ages out");
+    }finally{
+        process.chdir(originalCwd);
+    }
+}
+
 async function testReferenceNodeTokenRotation(){
     const node = new Node("reference-node", 3000, "old-token");
     node.setToken("new-token");
@@ -511,6 +695,9 @@ async function testReferenceNodeTokenRotation(){
     await testReferenceNodeTokenRotation();
     await testJobHistoryLedger();
     await testJobHistoryArchiveMigration();
+    await testCommitIdempotency();
+    await testOrphanSweeper();
+    await testLedgerAwareCleanup();
     await testRemoveWithoutRoute();
     console.log("All tests passed");
 
