@@ -22,6 +22,8 @@
 //
 //   1. Release dispatch claims stranded by a gateway that died mid-hand-off,
 //      otherwise a persisted claim would reject every retry and resume forever.
+//      Before releasing, probe any persisted worker so a task the worker already
+//      accepted is restored rather than re-dispatched.
 //   2. Settle jobs the gateway has permanently lost track of, so they stop
 //      rendering as "In progress" with no activity.
 //
@@ -50,7 +52,8 @@ function orphanTimeoutMs(){
 }
 
 // A dispatch is live only while the gateway holds in-memory state for it. After
-// a restart nothing does, which is precisely when a persisted claim must go.
+// a restart nothing does, which is precisely when a persisted claim must go —
+// unless recoverDispatchClaims() can prove a worker already owns the task.
 async function hasLiveDispatch(uuid){
     if (await tasktable.lookup(uuid)) return true;
     if (await routetable.lookup(uuid)) return true;
@@ -61,6 +64,7 @@ async function hasLiveDispatch(uuid){
 // transport failures and API errors into the same {error} shape, so the message
 // is the only signal that separates "worker is down" from "task is gone".
 const TASK_MISSING = /not found/i;
+const AUTH_FAILED = /401|403|unauthorized|forbidden|invalid.*(token|auth)/i;
 
 async function workerAnswers(node){
     const info = await node.getRequest('/info');
@@ -78,21 +82,124 @@ async function probeWorker(job, routedNode = null){
         return {reachable: false, registered: false, reason: 'no worker was ever assigned'};
     }
 
-    const registered = routedNode || nodes.find(n => n.hostname() === hint.hostname && n.port() === hint.port);
-    const node = registered || new Node(hint.hostname, hint.port);
+    const registered = routedNode || (hint && nodes.find(n => n.hostname() === hint.hostname && n.port() === hint.port));
+    // Prefer a registered node (has its current token). Otherwise rebuild from
+    // the ledger hint, including any token persisted before the outbound commit.
+    const node = registered || new Node(hint.hostname, hint.port, (hint && hint.token) || "");
 
     const info = await node.taskInfo(job.uuid);
     if (!info || info.error){
         const reason = (info && info.error) || 'no response';
+        // Only an actual auth rejection is inconclusive. An open worker with no
+        // token that answers "not found" is still a definitive verdict.
+        const authFailed = AUTH_FAILED.test(reason);
 
-        // A worker that still answers /info is healthy, so its verdict on a task
-        // it no longer holds is final rather than a network blip worth waiting out.
-        const taskGone = TASK_MISSING.test(reason) && await workerAnswers(node);
+        // Only treat "not found" as definitive when we were allowed to ask.
+        // A 401 from an autospawned worker must not look like a missing task.
+        const taskGone = !authFailed && TASK_MISSING.test(reason) && await workerAnswers(node);
 
-        return {reachable: false, taskGone, registered: !!registered, node, reason};
+        return {reachable: false, taskGone, authFailed, registered: !!registered, node, reason};
     }
 
     return {reachable: true, registered: !!registered, node, info};
+}
+
+async function applyReachableProbe(job, probe, route){
+    const code = probe.info.status && probe.info.status.code;
+    const unfinished = [statusCodes.QUEUED, statusCodes.RUNNING].indexOf(code) !== -1;
+
+    if (unfinished){
+        if (!route){
+            // Only restore a route we can actually persist; a node absent from
+            // nodes.json would be dropped again on the next reload.
+            if (probe.registered) await routetable.add(job.uuid, probe.node, job.ownerKey);
+            else if (probe.node && probe.node.getToken()){
+                // Ledger still has the token even if nodes.json dropped the
+                // entry; keep a route so status reads keep working this boot.
+                await routetable.add(job.uuid, probe.node, job.ownerKey);
+            }
+        }
+        await jobHistory.record(job.uuid, 'recovered', {
+            status: jobHistory.STATUS.RUNNING,
+            detail: `worker ${probe.node} still has this task`
+        });
+        await jobHistory.setDispatchPhase(job.uuid, jobHistory.DISPATCH_PHASE.ROUTED);
+        await jobHistory.setDispatchNode(job.uuid, probe.node);
+    }else{
+        const status = probe.info.status || {};
+        await jobHistory.recordWorkerOutcome(job.uuid, probe.info, {
+            detail: status.errorMessage || `reported by worker ${probe.node}`
+        });
+        if (route) await routetable.delete(job.uuid);
+    }
+
+    return code;
+}
+
+/**
+ * Before releasing a mid-dispatch claim on boot, ask the persisted worker
+ * whether it already accepted the task. Clearing blindly would let a resume
+ * launch a second worker while the first run continues.
+ */
+async function recoverDispatchClaims(){
+    const candidates = await jobHistory.listNonTerminal();
+    let recovered = 0;
+    let cleared = 0;
+
+    for (const job of candidates){
+        const phase = job.dispatchPhase;
+        if (phase !== jobHistory.DISPATCH_PHASE.ACCEPTED &&
+            phase !== jobHistory.DISPATCH_PHASE.QUEUED &&
+            phase !== jobHistory.DISPATCH_PHASE.DISPATCHING){
+            continue;
+        }
+        if (await hasLiveDispatch(job.uuid)) continue;
+
+        const hint = jobHistory.lastNodeHint(job);
+        if (hint && (hint.token || nodes.find(n => n.hostname() === hint.hostname && n.port() === hint.port))){
+            let probe;
+            try{
+                probe = await probeWorker(job);
+            }catch(e){
+                probe = {reachable: false, reason: e.message};
+            }
+
+            if (probe.reachable){
+                await applyReachableProbe(job, probe, null);
+                recovered++;
+                logger.event('task.recovered', {
+                    taskId: job.uuid,
+                    imagesCount: job.imagesCount,
+                    node: String(probe.node),
+                    statusCode: probe.info.status && probe.info.status.code,
+                    detail: 'boot recovery kept worker claim'
+                });
+                continue;
+            }
+
+            if (probe.taskGone){
+                await jobHistory.record(job.uuid, 'failed', {
+                    status: jobHistory.STATUS.FAILED,
+                    detail: `worker ${probe.node} no longer has this task`
+                });
+                await jobHistory.clearDispatchPhase(job.uuid);
+                cleared++;
+                continue;
+            }
+        }
+
+        await jobHistory.clearDispatchPhase(job.uuid);
+        cleared++;
+    }
+
+    if (cleared){
+        logger.event('task.dispatch.reset', {
+            count: cleared,
+            recovered
+        });
+    }
+
+    return {recovered, cleared};
 }
 
 async function sweep(){
@@ -121,26 +228,12 @@ async function sweep(){
         }
 
         if (probe.reachable){
-            const code = probe.info.status && probe.info.status.code;
-            const unfinished = [statusCodes.QUEUED, statusCodes.RUNNING].indexOf(code) !== -1;
-
-            if (unfinished){
-                if (route) continue;
-
-                // Only restore a route we can actually persist; a node absent from
-                // nodes.json would be dropped again on the next reload.
-                if (probe.registered) await routetable.add(job.uuid, probe.node, job.ownerKey);
-                await jobHistory.record(job.uuid, 'recovered', {
-                    status: jobHistory.STATUS.RUNNING,
-                    detail: `worker ${probe.node} still has this task`
-                });
-            }else{
-                const status = probe.info.status || {};
-                await jobHistory.recordWorkerOutcome(job.uuid, probe.info, {
-                    detail: status.errorMessage || `reported by worker ${probe.node}`
-                });
+            if (route && [statusCodes.QUEUED, statusCodes.RUNNING].indexOf(
+                    probe.info.status && probe.info.status.code) !== -1){
+                continue;
             }
 
+            const code = await applyReachableProbe(job, probe, route);
             healed++;
             logger.event('task.recovered', {
                 taskId: job.uuid,
@@ -151,6 +244,10 @@ async function sweep(){
             });
             continue;
         }
+
+        // An auth failure is not evidence the task is gone — we simply could
+        // not ask. Never orphan on that signal, regardless of age.
+        if (probe.authFailed) continue;
 
         // A transient worker outage must not turn a healthy routed task into a
         // failure. The same age threshold used for route-less orphans applies,
@@ -214,12 +311,9 @@ async function findOrphans(){
 
 module.exports = {
     initialize: async function(){
-        const cleared = await jobHistory.clearStaleDispatchPhases(hasLiveDispatch);
-        if (cleared.length){
-            logger.event('task.dispatch.reset', {
-                count: cleared.length,
-                taskIds: cleared.slice(0, 20)
-            });
+        const result = await recoverDispatchClaims();
+        if (result.cleared || result.recovered){
+            logger.info(`Dispatch recovery: ${result.recovered} restored from worker, ${result.cleared} claims released`);
         }
 
         await sweep();
@@ -229,6 +323,8 @@ module.exports = {
     },
 
     hasLiveDispatch,
+    recoverDispatchClaims,
     sweep,
-    findOrphans
+    findOrphans,
+    probeWorker
 };

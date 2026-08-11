@@ -128,6 +128,9 @@ function newRecord(uuid, ownerKey, now){
         lastUpdatedBy: null,
         dispatchPhase: null,
         dispatchAcceptedAt: null,
+        // Last worker we handed this job to (host/port/token). Survives a
+        // mid-dispatch crash so boot recovery can probe before releasing the claim.
+        worker: null,
         events: []
     };
 }
@@ -303,7 +306,12 @@ module.exports = {
         if (!job) return null;
 
         job.dispatchPhase = phase || null;
-        if (!phase) job.dispatchAcceptedAt = null;
+        if (!phase){
+            job.dispatchAcceptedAt = null;
+            // A released claim means this attempt is over; a retry must not
+            // inherit a half-assigned worker from the failed attempt.
+            if (job.worker && job.worker.token) job.worker = null;
+        }
         job.updatedAt = new Date().getTime();
         scheduleSave();
         return job;
@@ -314,9 +322,32 @@ module.exports = {
     },
 
     /**
+     * Remembers which worker is being (or was) handed this task, including its
+     * NodeODM token. Without the token, a post-restart probe of an autospawned
+     * worker looks like "unreachable" and the sweeper can orphan a live job.
+     */
+    setDispatchNode: async function(uuid, node){
+        if (!uuid || !jobs || !node) return null;
+        const job = jobs[uuid];
+        if (!job) return null;
+
+        job.worker = {
+            hostname: node.hostname(),
+            port: node.port(),
+            token: node.getToken() || ""
+        };
+        job.updatedAt = new Date().getTime();
+        scheduleSave();
+        return job;
+    },
+
+    /**
      * Drops dispatch claims left behind by a gateway that died mid-hand-off.
      * Without this, a persisted `accepted` phase would reject every retry and
      * every resume attempt forever, turning the idempotency guard into a trap.
+     *
+     * Prefer recoverDispatchClaims() in reconcile.js when a worker may already
+     * own the task; this helper is the blunt fallback that only clears.
      *
      * @param isLive {function} async (uuid) => bool, true while a dispatch is
      *                          genuinely still running for that task.
@@ -332,6 +363,7 @@ module.exports = {
 
             job.dispatchPhase = null;
             job.dispatchAcceptedAt = null;
+            job.worker = null;
             cleared.push(uuid);
         }
 
@@ -365,16 +397,26 @@ module.exports = {
     },
 
     /**
-     * Last known worker for a job, as "hostname:port", recovered from the
-     * `routed` event. Lets the sweeper probe a worker whose route was dropped.
+     * Last known worker for a job. Prefers the persisted worker record (which
+     * carries the auth token) and falls back to the `routed` event's host:port.
      */
     lastNodeHint: function(job){
-        if (!job || !Array.isArray(job.events)) return null;
+        if (!job) return null;
+
+        if (job.worker && job.worker.hostname){
+            return {
+                hostname: job.worker.hostname,
+                port: parseInt(job.worker.port, 10),
+                token: job.worker.token || ""
+            };
+        }
+
+        if (!Array.isArray(job.events)) return null;
         for (let i = job.events.length - 1; i >= 0; i--){
             const event = job.events[i];
             if (event.action !== 'routed' || !event.detail) continue;
             const match = String(event.detail).match(/^([^\s:]+):(\d+)$/);
-            if (match) return {hostname: match[1], port: parseInt(match[2], 10)};
+            if (match) return {hostname: match[1], port: parseInt(match[2], 10), token: ""};
         }
         return null;
     },
@@ -461,6 +503,9 @@ module.exports = {
             if (isTerminal(job.status)){
                 job.dispatchPhase = null;
                 job.dispatchAcceptedAt = null;
+                // Drop the worker token once the job is settled; host/port are
+                // still recoverable from the routed event if needed.
+                if (job.worker) job.worker.token = "";
             }
         }
 

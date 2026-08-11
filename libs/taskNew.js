@@ -358,7 +358,7 @@ module.exports = {
             taskId: uuid,
             imagesCount,
             autoscale: !!autoscale,
-            node: String(node)
+            node: autoscale ? null : String(node)
         });
 
         // Validate options
@@ -378,6 +378,19 @@ module.exports = {
             options: taskOptions,
             imagesCount: imagesCount
         };
+
+        // For a static node the target is known now — persist it before the
+        // outbound commit so boot recovery can probe if we die mid-upload.
+        // Autoscaled targets are persisted after createNode below.
+        if (!autoscale && node){
+            await jobHistory.setDispatchNode(uuid, node);
+            logger.event('task.dispatch.node', {
+                taskId: uuid,
+                imagesCount,
+                node: String(node),
+                autoscale: false
+            });
+        }
 
         const PARALLEL_UPLOADS = 20;
 
@@ -652,11 +665,15 @@ module.exports = {
                 node = await asr.createNode(req, imagesCount, token, dmHostname, status);
                 if (!status.aborted) nodes.add(node);
                 else return;
+                // Persist before doUpload: if we die after the worker accepts
+                // the commit, boot recovery must still find host/port/token.
+                await jobHistory.setDispatchNode(uuid, node);
                 logger.event('task.dispatch.node', {
                     taskId: uuid,
                     imagesCount,
                     node: String(node),
-                    hostname: dmHostname
+                    hostname: dmHostname,
+                    autoscale: true
                 });
             }catch(e){
                 const err = new Error("No nodes available (attempted to autoscale but failed). Try again later.");
@@ -674,6 +691,7 @@ module.exports = {
 
             await routetable.add(uuid, node, token);
             await tasktable.delete(uuid);
+            await jobHistory.setDispatchNode(uuid, node);
             await jobHistory.record(uuid, 'routed', {
                 ownerKey: token,
                 actor,

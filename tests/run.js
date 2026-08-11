@@ -663,10 +663,117 @@ async function testOrphanSweeper(){
                            "a live worker that lost the task must settle it immediately");
         assert.strictEqual(await routetable.lookup(routedMissing), null,
                            "the dead route must go, or status reads keep hitting the worker");
+
+        // A worker that requires auth must not be orphaned just because we lost
+        // its token — that probe is inconclusive, not proof the task is gone.
+        const authed = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+        await stale(authed);
+        await jobHistory.record(authed, "routed", {
+            status: jobHistory.STATUS.RUNNING,
+            detail: `127.0.0.1:${workerPort}`,
+            at: twoHoursAgo
+        });
+        // Persist host/port with an empty token so probeWorker rebuilds an
+        // unauthenticated client against a token-gated worker.
+        const authedJob = await jobHistory.lookup(authed);
+        authedJob.worker = {hostname: "127.0.0.1", port: workerPort, token: ""};
+        const gated = http.createServer((req, res) => {
+            if (!/[?&]token=secret\b/.test(req.url)){
+                res.writeHead(401, {"Content-Type": "application/json"});
+                res.end(JSON.stringify({error: "Unauthorized"}));
+                return;
+            }
+            res.writeHead(200, {"Content-Type": "application/json"});
+            if (req.url.indexOf("/task/") === 0){
+                res.end(JSON.stringify({uuid: authed, status: {code: statusCodes.RUNNING}}));
+            }else{
+                res.end(JSON.stringify({version: "1.5.3"}));
+            }
+        });
+        await new Promise(resolve => gated.listen(0, "127.0.0.1", resolve));
+        const gatedPort = gated.address().port;
+        authedJob.worker.port = gatedPort;
+        authedJob.events.push({
+            at: twoHoursAgo,
+            action: "routed",
+            actor: null,
+            detail: `127.0.0.1:${gatedPort}`
+        });
+
+        const gatedSweep = await reconcile.sweep();
+        assert.strictEqual((await jobHistory.lookup(authed)).status, jobHistory.STATUS.RUNNING,
+                           "an auth-failed probe must not orphan a running task");
+        assert.strictEqual(gatedSweep.orphaned, 0,
+                           "auth-failed probes must not contribute to the orphan count");
+        await new Promise(resolve => gated.close(resolve));
     }finally{
         await new Promise(resolve => worker.close(resolve));
         process.chdir(originalCwd);
         config.orphan_timeout = originalTimeout;
+    }
+}
+
+// A gateway that dies after the worker accepted the commit but before the route
+// is written must restore that worker on boot, not release the claim for a
+// second dispatch.
+async function testDispatchClaimRecovery(){
+    const jobHistory = require("../libs/jobHistory");
+    const reconcile = require("../libs/reconcile");
+    const routetable = require("../libs/routetable");
+    const tasktable = require("../libs/tasktable");
+    const statusCodes = require("../libs/statusCodes");
+
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "clusterodm-recover-"));
+    fs.mkdirSync(path.join(workDir, "data"));
+    const originalCwd = process.cwd();
+    process.chdir(workDir);
+
+    const uuid = "12121212-1212-4121-8121-121212121212";
+    const worker = http.createServer((req, res) => {
+        res.writeHead(200, {"Content-Type": "application/json"});
+        if (req.url.indexOf("/task/") === 0){
+            res.end(JSON.stringify({uuid, status: {code: statusCodes.RUNNING}}));
+        }else{
+            res.end(JSON.stringify({version: "1.5.3"}));
+        }
+    });
+
+    try{
+        await new Promise(resolve => worker.listen(0, "127.0.0.1", resolve));
+        const workerPort = worker.address().port;
+
+        await jobHistory.initialize(path.join("data", "jobs.json"));
+        await routetable.initialize();
+        await tasktable.initialize();
+
+        await jobHistory.record(uuid, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
+        jobHistory.tryAcceptCommit(uuid, {ownerKey: "owner-a"});
+        await jobHistory.setDispatchPhase(uuid, jobHistory.DISPATCH_PHASE.DISPATCHING);
+        await jobHistory.setDispatchNode(uuid, new Node("127.0.0.1", workerPort, "worker-token"));
+
+        const hint = jobHistory.lastNodeHint(await jobHistory.lookup(uuid));
+        assert.strictEqual(hint.token, "worker-token");
+        assert.strictEqual(hint.port, workerPort);
+
+        const result = await reconcile.recoverDispatchClaims();
+        assert.strictEqual(result.recovered, 1, `expected worker restored, got ${JSON.stringify(result)}`);
+        assert.strictEqual((await jobHistory.lookup(uuid)).dispatchPhase, jobHistory.DISPATCH_PHASE.ROUTED);
+        assert.strictEqual((await jobHistory.lookup(uuid)).status, jobHistory.STATUS.RUNNING);
+        assert.ok(await routetable.lookup(uuid), "boot recovery must restore a route for status reads");
+
+        // No worker on the claim → release so a resume can proceed.
+        const stranded = "34343434-3434-4343-8343-343434343434";
+        await jobHistory.record(stranded, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
+        jobHistory.tryAcceptCommit(stranded, {ownerKey: "owner-a"});
+        await jobHistory.setDispatchPhase(stranded, jobHistory.DISPATCH_PHASE.DISPATCHING);
+        const released = await reconcile.recoverDispatchClaims();
+        assert.ok(released.cleared >= 1);
+        assert.strictEqual((await jobHistory.lookup(stranded)).dispatchPhase, null);
+        assert.strictEqual(jobHistory.tryAcceptCommit(stranded).accepted, true,
+                           "a claim with no recoverable worker must be resumable");
+    }finally{
+        await new Promise(resolve => worker.close(resolve));
+        process.chdir(originalCwd);
     }
 }
 
@@ -736,6 +843,7 @@ async function testReferenceNodeTokenRotation(){
     await testJobHistoryArchiveMigration();
     await testCommitIdempotency();
     await testOrphanSweeper();
+    await testDispatchClaimRecovery();
     await testLedgerAwareCleanup();
     await testRemoveWithoutRoute();
     console.log("All tests passed");

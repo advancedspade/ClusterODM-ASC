@@ -326,14 +326,6 @@ module.exports = {
                 json(res, {uuid: taskId});
             };
 
-            // Rejections that the user can act on: the upload stays on disk and the
-            // ledger stays resumable, so a retry or the pending banner still works.
-            const rejectRetryable = async (err) => {
-                await jobHistory.clearDispatchPhase(taskId);
-                logger.event('task.commit.rejected', {taskId, actor: actorEmail, detail: err});
-                json(res, {error: err});
-            };
-
             const die = async (err) => {
                 await jobHistory.record(taskId, 'failed', {
                     ownerKey: userToken,
@@ -347,9 +339,12 @@ module.exports = {
                 json(res, {error: err});
             };
 
-            // The guards below deliberately run before the concurrency checks: a
-            // retry must not consume the per-minute commit budget, which exists to
-            // rate-limit genuinely new tasks.
+            // Early exits that mean "this upload is already spoken for" must run
+            // before concurrency accounting, so a retry does not burn the
+            // per-minute commit budget reserved for genuinely new tasks. The
+            // ledger claim itself waits until validation succeeds: otherwise a
+            // concurrent retry can be told {uuid} while the winner later rejects
+            // and clears the phase.
             const routedNode = await routetable.lookupNode(taskId);
             if (routedNode){
                 duplicate('routed', {node: String(routedNode)});
@@ -359,11 +354,56 @@ module.exports = {
                 duplicate('dispatching');
                 return;
             }
-
-            if (!fs.existsSync(bodyFile)){
-                await rejectRetryable(`Cannot commit task ${taskId}: its uploaded files are no longer available. Please upload again.`);
+            if (await jobHistory.hasActiveDispatch(taskId)){
+                duplicate('in-progress');
                 return;
             }
+            const existing = await jobHistory.lookup(taskId);
+            if (existing && existing.dispatchPhase === jobHistory.DISPATCH_PHASE.ROUTED){
+                duplicate('routed');
+                return;
+            }
+            if (existing && (existing.status === jobHistory.STATUS.DELETED ||
+                             existing.status === jobHistory.STATUS.CANCELED)){
+                logger.event('task.commit.rejected', {taskId, actor: actorEmail, detail: existing.status});
+                json(res, {error: `Task ${taskId} was ${existing.status} and cannot be committed again.`});
+                return;
+            }
+            if (existing && existing.status === jobHistory.STATUS.SUCCEEDED){
+                duplicate('succeeded');
+                return;
+            }
+
+            if (!fs.existsSync(bodyFile)){
+                logger.event('task.commit.rejected', {taskId, actor: actorEmail, detail: 'missing upload'});
+                json(res, {error: `Cannot commit task ${taskId}: its uploaded files are no longer available. Please upload again.`});
+                return;
+            }
+
+            if (concurrencyMonitor.checkCommitLimitReached(limits.maxConcurrentTasks, userToken)){
+                logger.event('task.commit.rejected', {taskId, actor: actorEmail, detail: 'commit limit'});
+                json(res, {error: `Reached maximum number of concurrent tasks, please wait until other tasks have finished, then restart the task.`});
+                return;
+            }
+
+            if (await maxConcurrencyLimitReached(limits.maxConcurrentTasks, userToken)){
+                logger.event('task.commit.rejected', {taskId, actor: actorEmail, detail: 'concurrency limit'});
+                json(res, {error: `Reached maximum number of concurrent tasks. Please wait until other tasks have finished, then restart the task.`});
+                return;
+            }
+
+            let body, files;
+            try{
+                body = JSON.parse(await fs.promises.readFile(bodyFile, 'utf8'));
+                files = (await fs.promises.readdir(tmpPath)).filter(f => f.toLowerCase() !== 'body.json');
+            }catch(e){
+                logger.event('task.commit.rejected', {taskId, actor: actorEmail, detail: e.message});
+                json(res, {error: `Cannot commit task: ${e.message}`});
+                return;
+            }
+
+            body.fileNames = files;
+            body.imagesCount = files.length;
 
             const claim = jobHistory.tryAcceptCommit(taskId, {ownerKey: userToken});
             if (!claim.accepted){
@@ -376,30 +416,8 @@ module.exports = {
                 return;
             }
 
-            if (concurrencyMonitor.checkCommitLimitReached(limits.maxConcurrentTasks, userToken)){
-                await rejectRetryable(`Reached maximum number of concurrent tasks, please wait until other tasks have finished, then restart the task.`);
-                return;
-            }
-
-            if (await maxConcurrencyLimitReached(limits.maxConcurrentTasks, userToken)){
-                await rejectRetryable(`Reached maximum number of concurrent tasks. Please wait until other tasks have finished, then restart the task.`);
-                return;
-            }
-
             floodMonitor.recordTaskCommit(userToken);
             utils.markTaskAsCommitted(taskId);
-
-            let body, files;
-            try{
-                body = JSON.parse(await fs.promises.readFile(bodyFile, 'utf8'));
-                files = (await fs.promises.readdir(tmpPath)).filter(f => f.toLowerCase() !== 'body.json');
-            }catch(e){
-                await rejectRetryable(`Cannot commit task: ${e.message}`);
-                return;
-            }
-
-            body.fileNames = files;
-            body.imagesCount = files.length;
 
             await jobHistory.record(taskId, 'uploaded', {
                 ownerKey: userToken,
@@ -759,6 +777,36 @@ module.exports = {
                     if (taskId) await commitTask({ req, res, taskId, userToken, actor, limits });
                     else json(res, { error: `No uuid found in ${pathname}`});
                 }else if (req.method === 'POST' && pathname === '/task/new') {
+                    // Absorb set-uuid retries before createContext: getUuid() would
+                    // otherwise reject any uuid already in tasktable/routetable as a
+                    // collision, which is exactly the idempotent retry we want to keep.
+                    const requestedUuid = req.headers['set-uuid'];
+                    if (requestedUuid && utils.isTaskUuid(requestedUuid)){
+                        if (await routetable.lookup(requestedUuid) ||
+                            await tasktable.lookup(requestedUuid) ||
+                            await jobHistory.hasActiveDispatch(requestedUuid)){
+                            logger.event('task.commit.duplicate', {
+                                taskId: requestedUuid,
+                                reason: 'in-progress',
+                                endpoint: '/task/new',
+                                actor: actor && actor.email
+                            });
+                            json(res, {uuid: requestedUuid});
+                            return;
+                        }
+                        const existingJob = await jobHistory.lookup(requestedUuid);
+                        if (existingJob && existingJob.dispatchPhase === jobHistory.DISPATCH_PHASE.ROUTED){
+                            logger.event('task.commit.duplicate', {
+                                taskId: requestedUuid,
+                                reason: 'routed',
+                                endpoint: '/task/new',
+                                actor: actor && actor.email
+                            });
+                            json(res, {uuid: requestedUuid});
+                            return;
+                        }
+                    }
+
                     let ctx = null;
                     try{
                         ctx = await taskNew.createContext(req, res);
@@ -780,9 +828,9 @@ module.exports = {
                             return;
                         }
 
-                        // Same idempotency gap as /task/new/commit: a client retrying
-                        // this one-shot endpoint with its own set-uuid must not get a
-                        // second worker for the same upload.
+                        // Claim only after the body parsed and quota cleared, so a
+                        // concurrent retry is not told {uuid} for an attempt that
+                        // later dies on validation.
                         const claim = jobHistory.tryAcceptCommit(uuid, {ownerKey: userToken});
                         if (!claim.accepted){
                             logger.event('task.commit.duplicate', {

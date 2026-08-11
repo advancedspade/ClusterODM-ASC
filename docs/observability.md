@@ -25,10 +25,18 @@ log for anything field-based.
 
 ## Events
 
-A healthy upload emits, in order: `task.init` → `task.upload.batch` (one per
-batch) → `task.commit.received` → `task.commit.accepted` →
-`task.commit.responded` → `task.dispatch.start` → `task.dispatch.node` →
-`task.routed`.
+A healthy upload emits, in order:
+
+`task.init` → `task.upload.batch` (one per batch) → `task.commit.received` →
+`task.commit.accepted` → `task.dispatch.start` → `task.dispatch.node` →
+`task.commit.responded` → `task.routed`.
+
+`task.dispatch.start` is emitted when the gateway begins the hand-off (before
+the commit response returns). `task.dispatch.node` names the worker for both
+static and autoscaled dispatches; for autoscaling it appears after the VM is
+online, still before images are forwarded. `task.commit.responded` is tied to
+the HTTP response finishing, so on a fast static dispatch it can land after
+`.start` / `.node`.
 
 | Event | Meaning |
 |-------|---------|
@@ -39,7 +47,7 @@ batch) → `task.commit.received` → `task.commit.accepted` →
 | `task.commit.duplicate` | Already routed or already dispatching — the retry was absorbed |
 | `task.commit.rejected` | Refused (deleted, canceled, over quota) |
 | `task.commit.responded` | Response finished. `outcome` is `responded` or `aborted` |
-| `task.dispatch.start` / `.node` | Handing off to a worker; `.node` names the target |
+| `task.dispatch.start` / `.node` | Hand-off begun; `.node` names the target (static and autoscale) |
 | `task.forward.retry` | Upload to the worker failed and is being retried |
 | `task.routed` | Worker owns the task; the gateway is now a proxy |
 | `task.queued` | No capacity; waiting for a node |
@@ -80,7 +88,10 @@ Read it against the healthy sequence above. Where it stops tells you the phase:
   but the client never got the answer. This is the weekend incident: the retry
   logic now absorbs it and you should see a later `task.commit.duplicate`.
 - stops after `task.dispatch.start` — the gateway died mid-dispatch. Boot
-  recovery emits `task.dispatch.reset` so a resume can proceed.
+  recovery first probes any persisted worker (host/port/token); if that worker
+  still has the task it restores the route instead of releasing the claim.
+  Only when the worker is gone does it emit `task.dispatch.reset` so a resume
+  can proceed.
 
 ### Everything the alert fires on
 

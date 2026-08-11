@@ -96,6 +96,14 @@ tasks every 30 seconds so completed and failed outcomes still appear in Projects
 like they do in production. If NodeODM restarts mid-task it loses the task, and
 the probe settles the job as failed instead of leaving it "In progress".
 
+`--access-log data/access.log` in `docker-compose.local.yml` writes every request
+the gateway receives to `docker/data/access.log`. Useful for spotting UI polling
+that runs hotter than intended:
+
+```bash
+tail -120 docker/data/access.log | awk '{print $3}' | sed 's/?.*//' | sort | uniq -c | sort -rn
+```
+
 ## Verify
 
 ```bash

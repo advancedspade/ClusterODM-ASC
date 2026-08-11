@@ -42,8 +42,18 @@
 
 	# JSON to stdout so the gcplogs driver ships it as structured data: a commit
 	# that never reached ClusterODM is only attributable from Caddy's side.
+	# Strip ?token= even though the OAuth UI usually leaves it empty — ClusterODM
+	# still accepts query-token auth for legacy clients, and that value must not
+	# land in Cloud Logging for every logging.viewer.
 	log {
 		output stdout
-		format json
+		format filter {
+			wrap json
+			fields {
+				request>uri query {
+					delete token
+				}
+			}
+		}
 	}
 }
