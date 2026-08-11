@@ -51,7 +51,8 @@ the HTTP response finishing, so on a fast static dispatch it can land after
 | `task.forward.retry` | Upload to the worker failed and is being retried |
 | `task.routed` | Worker owns the task; the gateway is now a proxy |
 | `task.queued` | No capacity; waiting for a node |
-| `task.dispatch.reset` | Boot-time recovery cleared a phase left behind by a restart |
+| `task.dispatch.retained` | Persisted worker unreachable; claim held and re-probed rather than released |
+| `task.dispatch.reset` | Dispatch recovery cleared a phase left behind by a restart |
 | `task.recovered` | Orphan sweep found the task alive on a worker and healed the ledger |
 | `task.orphaned` | Orphan sweep gave up and marked the task failed |
 | `task.failed` | Task failed; `detail` carries the reason |
@@ -87,11 +88,14 @@ Read it against the healthy sequence above. Where it stops tells you the phase:
 - `task.commit.responded` with `outcome="aborted"` — the gateway did the work
   but the client never got the answer. This is the weekend incident: the retry
   logic now absorbs it and you should see a later `task.commit.duplicate`.
-- stops after `task.dispatch.start` — the gateway died mid-dispatch. Boot
-  recovery first probes any persisted worker (host/port/token); if that worker
-  still has the task it restores the route instead of releasing the claim.
-  Only when the worker is gone does it emit `task.dispatch.reset` so a resume
-  can proceed.
+- stops after `task.dispatch.start` — the gateway died mid-dispatch. Dispatch
+  recovery probes the persisted worker (host/port/token) at boot and on every
+  sweep. If that worker still has the task it restores the route instead of
+  releasing the claim. A claim is only released on proof — the worker answers
+  that it does not have the task, or the job ages past `--orphan-timeout` — and
+  that release is what emits `task.dispatch.reset`. An unreachable worker emits
+  `task.dispatch.retained` instead and is asked again next pass, because
+  releasing on a timeout is how a resume starts a duplicate run.
 
 ### Everything the alert fires on
 
@@ -176,9 +180,11 @@ docker exec -it clusterodm telnet localhost 8080
 | `TASK ORPHANS` | Non-terminal ledger rows with no live task and no route |
 
 Uploads survive 72 hours on the gateway (`--tmp-max-age`), so a Friday failure
-is still resumable Monday morning. The orphan sweeper runs at boot and hourly,
-and only fails a job after `--orphan-timeout` hours (6 by default) and only
-after probing the worker first.
+is still resumable Monday morning. `--stale-uploads-timeout` does not shorten
+that: an upload whose job is in progress or failed is exempt from it, so only
+the hard age cap ends the Resume window. The orphan sweeper runs at boot and
+every 30 seconds, and only fails a job after `--orphan-timeout` hours (6 by
+default) and only after probing the worker first.
 
 ## Alerting
 

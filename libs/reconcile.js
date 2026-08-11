@@ -22,8 +22,9 @@
 //
 //   1. Release dispatch claims stranded by a gateway that died mid-hand-off,
 //      otherwise a persisted claim would reject every retry and resume forever.
-//      Before releasing, probe any persisted worker so a task the worker already
-//      accepted is restored rather than re-dispatched.
+//      A claim with a persisted worker is only released on proof: the worker says
+//      it does not have the task, or the job has aged past --orphan-timeout. An
+//      unreachable worker keeps its claim and is re-probed next pass.
 //   2. Settle jobs the gateway has permanently lost track of, so they stop
 //      rendering as "In progress" with no activity.
 //
@@ -137,14 +138,20 @@ async function applyReachableProbe(job, probe, route){
 }
 
 /**
- * Before releasing a mid-dispatch claim on boot, ask the persisted worker
- * whether it already accepted the task. Clearing blindly would let a resume
- * launch a second worker while the first run continues.
+ * Before releasing a mid-dispatch claim, ask the persisted worker whether it
+ * already accepted the task. Clearing blindly would let a resume launch a second
+ * worker while the first run continues.
+ *
+ * Runs on every reconcile pass, not just at boot, because an inconclusive probe
+ * keeps its claim and has to be asked again.
  */
 async function recoverDispatchClaims(){
     const candidates = await jobHistory.listNonTerminal();
+    const now = new Date().getTime();
+    const threshold = orphanTimeoutMs();
     let recovered = 0;
     let cleared = 0;
+    let retained = 0;
 
     for (const job of candidates){
         const phase = job.dispatchPhase;
@@ -172,7 +179,7 @@ async function recoverDispatchClaims(){
                     imagesCount: job.imagesCount,
                     node: String(probe.node),
                     statusCode: probe.info.status && probe.info.status.code,
-                    detail: 'boot recovery kept worker claim'
+                    detail: 'dispatch recovery kept worker claim'
                 });
                 continue;
             }
@@ -186,20 +193,41 @@ async function recoverDispatchClaims(){
                 cleared++;
                 continue;
             }
+
+            // Anything else — a timeout, a refused connection, a 401 — means we
+            // could not ask, not that the task is gone. The worker may be running
+            // it right now, and this claim is the only thing stopping a resume
+            // from starting a second run, so hold it and ask again next pass.
+            const age = now - (job.updatedAt || job.createdAt || now);
+            if (age < threshold){
+                retained++;
+                logger.event('task.dispatch.retained', {
+                    taskId: job.uuid,
+                    imagesCount: job.imagesCount,
+                    node: probe.node ? String(probe.node) : `${hint.hostname}:${hint.port}`,
+                    ageMs: age,
+                    detail: probe.reason,
+                    level: 'warn'
+                });
+                continue;
+            }
+            // Held long enough that a live run is no longer plausible. Release so
+            // the upload is resumable; the sweep settles the job the same pass.
         }
 
         await jobHistory.clearDispatchPhase(job.uuid);
         cleared++;
     }
 
-    if (cleared){
+    if (cleared || retained){
         logger.event('task.dispatch.reset', {
             count: cleared,
-            recovered
+            recovered,
+            retained
         });
     }
 
-    return {recovered, cleared};
+    return {recovered, cleared, retained};
 }
 
 async function sweep(){
@@ -312,13 +340,19 @@ async function findOrphans(){
 module.exports = {
     initialize: async function(){
         const result = await recoverDispatchClaims();
-        if (result.cleared || result.recovered){
-            logger.info(`Dispatch recovery: ${result.recovered} restored from worker, ${result.cleared} claims released`);
+        if (result.cleared || result.recovered || result.retained){
+            logger.info(`Dispatch recovery: ${result.recovered} restored from worker, ` +
+                        `${result.cleared} claims released, ${result.retained} held pending re-probe`);
         }
 
         await sweep();
         setInterval(() => {
-            sweep().catch(e => logger.warn(`Orphan sweep failed: ${e.message}`));
+            // Claim recovery re-runs so a worker that was unreachable last pass is
+            // asked again, instead of a single startup timeout deciding the fate of
+            // a task that may still be processing.
+            recoverDispatchClaims()
+                .then(sweep)
+                .catch(e => logger.warn(`Reconcile pass failed: ${e.message}`));
         }, SWEEP_INTERVAL);
     },
 

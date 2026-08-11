@@ -210,6 +210,15 @@ function isTerminal(status){
     return TERMINAL.indexOf(status) !== -1;
 }
 
+// Whether a job's upload may still be committed again. A failed row qualifies:
+// that is what a swept orphan or a rejected commit looks like, and its files are
+// the only way back. Succeeded/canceled/deleted are final. Cleanup and the
+// pending-uploads list must agree here, or one deletes what the other offers.
+function isResumable(job){
+    if (!job) return false;
+    return !isTerminal(job.status) || job.status === STATUS.FAILED;
+}
+
 function toPublic(record){
     return {
         uuid: record.uuid,
@@ -258,29 +267,32 @@ module.exports = {
      * returns the original task instead of launching a second worker.
      *
      * The read-modify-write below runs without an await, which is what makes it
-     * atomic against concurrent requests on Node's single thread; the disk write
-     * it schedules is serialized by writeChain as usual.
+     * atomic against concurrent requests on Node's single thread. Durability is
+     * therefore the caller's job: await `saved` before answering the client or
+     * touching a worker, or a restart in that window reloads a ledger with no
+     * claim and dispatches the same upload twice.
      *
-     * @return {object} {accepted, reason, revived, job}
+     * @return {object} {accepted, reason, revived, job, saved}
      */
     tryAcceptCommit: function(uuid, options = {}){
-        if (!uuid || !jobs) return {accepted: true, reason: null, revived: false, job: null};
+        const nothingWritten = Promise.resolve();
+        if (!uuid || !jobs) return {accepted: true, reason: null, revived: false, job: null, saved: nothingWritten};
 
         const now = options.at || new Date().getTime();
         const job = jobs[uuid];
 
         if (job){
             if (isActivePhase(job.dispatchPhase)){
-                return {accepted: false, reason: 'in-progress', revived: false, job};
+                return {accepted: false, reason: 'in-progress', revived: false, job, saved: nothingWritten};
             }
             if (job.dispatchPhase === DISPATCH_PHASE.ROUTED){
-                return {accepted: false, reason: 'routed', revived: false, job};
+                return {accepted: false, reason: 'routed', revived: false, job, saved: nothingWritten};
             }
             if (job.status === STATUS.DELETED || job.status === STATUS.CANCELED){
-                return {accepted: false, reason: job.status, revived: false, job};
+                return {accepted: false, reason: job.status, revived: false, job, saved: nothingWritten};
             }
             if (job.status === STATUS.SUCCEEDED){
-                return {accepted: false, reason: 'succeeded', revived: false, job};
+                return {accepted: false, reason: 'succeeded', revived: false, job, saved: nothingWritten};
             }
         }
 
@@ -295,9 +307,7 @@ module.exports = {
         target.dispatchAcceptedAt = now;
         target.updatedAt = now;
 
-        scheduleSave();
-
-        return {accepted: true, reason: null, revived, job: target};
+        return {accepted: true, reason: null, revived, job: target, saved: scheduleSave()};
     },
 
     setDispatchPhase: async function(uuid, phase){
@@ -313,7 +323,7 @@ module.exports = {
             if (job.worker && job.worker.token) job.worker = null;
         }
         job.updatedAt = new Date().getTime();
-        scheduleSave();
+        await scheduleSave();
         return job;
     },
 
@@ -325,6 +335,9 @@ module.exports = {
      * Remembers which worker is being (or was) handed this task, including its
      * NodeODM token. Without the token, a post-restart probe of an autospawned
      * worker looks like "unreachable" and the sweeper can orphan a live job.
+     *
+     * Resolves once the hint is on disk, so callers must await it before the
+     * outbound commit: a crash in between leaves a claim with no worker to probe.
      */
     setDispatchNode: async function(uuid, node){
         if (!uuid || !jobs || !node) return null;
@@ -337,7 +350,7 @@ module.exports = {
             token: node.getToken() || ""
         };
         job.updatedAt = new Date().getTime();
-        scheduleSave();
+        await scheduleSave();
         return job;
     },
 
@@ -367,7 +380,7 @@ module.exports = {
             cleared.push(uuid);
         }
 
-        if (cleared.length) scheduleSave();
+        if (cleared.length) await scheduleSave();
         return cleared;
     },
 
@@ -383,6 +396,10 @@ module.exports = {
 
     isTerminal: function(status){
         return isTerminal(status);
+    },
+
+    isResumable: function(job){
+        return isResumable(job);
     },
 
     /**
@@ -522,7 +539,11 @@ module.exports = {
         job.updatedAt = now;
         if (actor) job.lastUpdatedBy = Object.assign({}, actor, {action});
 
-        scheduleSave();
+        // Resolves only once the event is on disk. Callers act on lifecycle
+        // transitions (dispatching, routing, settling) right after this returns,
+        // so a fire-and-forget write would let a restart lose the transition and
+        // replay work the gateway already started.
+        await scheduleSave();
 
         return job;
     },

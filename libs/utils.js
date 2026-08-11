@@ -83,9 +83,12 @@ module.exports = {
      * `staleUploadsTimeout` (no new files for that long) and `maxAgeHours` (hard
      * cap on directory age, which is also the resume window).
      *
-     * Both defer to the job ledger, because tmpUploadsMap lives only in memory:
-     * after a restart it cannot tell a committed upload from an abandoned one, and
-     * deleting a committed-but-not-yet-dispatched upload loses the user's work.
+     * The stale rule defers to the job ledger, because tmpUploadsMap lives only
+     * in memory: after a restart it cannot tell a committed upload from an
+     * abandoned one, and deleting a committed-but-not-yet-dispatched upload loses
+     * the user's work. Uploads a client can still resume (jobHistory.isResumable,
+     * which includes failed rows) are exempt from it, so `maxAgeHours` alone
+     * bounds the resume window.
      */
     cleanupTemporaryDirectory: async function(staleUploadsTimeout = 0, maxAgeHours = DEFAULT_TMP_MAX_AGE_HOURS){
         const self = this;
@@ -111,7 +114,7 @@ module.exports = {
                     if (await jobHistory.hasActiveDispatch(entry)) continue;
 
                     const job = await jobHistory.lookup(entry);
-                    const resumable = !!job && !jobHistory.isTerminal(job.status);
+                    const resumable = jobHistory.isResumable(job);
 
                     if (staleUploadsTimeout > 0 && !resumable){
                         try{

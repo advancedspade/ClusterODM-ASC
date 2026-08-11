@@ -289,9 +289,7 @@ module.exports = {
                 if (job){
                     if (job.ownerKey && userToken && job.ownerKey !== userToken) continue;
 
-                    // A failed row is still resumable while its files exist (that is
-                    // the swept-orphan case); the other outcomes are final.
-                    if (jobHistory.isTerminal(job.status) && job.status !== jobHistory.STATUS.FAILED) continue;
+                    if (!jobHistory.isResumable(job)) continue;
                 }
 
                 const createdAt = (job && job.createdAt) || stats.mtime.getTime();
@@ -415,6 +413,11 @@ module.exports = {
                 }
                 return;
             }
+
+            // Nothing may observe the claim before it is durable: a restart
+            // between here and the worker hand-off would reload a ledger with no
+            // claim and dispatch this same upload a second time.
+            await claim.saved;
 
             floodMonitor.recordTaskCommit(userToken);
             utils.markTaskAsCommitted(taskId);
@@ -795,6 +798,20 @@ module.exports = {
                             return;
                         }
                         const existingJob = await jobHistory.lookup(requestedUuid);
+                        // Canceled and deleted are final. Say so before reading the
+                        // body, or the client uploads an entire task to a uuid that
+                        // can never be dispatched.
+                        if (existingJob && (existingJob.status === jobHistory.STATUS.DELETED ||
+                                            existingJob.status === jobHistory.STATUS.CANCELED)){
+                            logger.event('task.commit.rejected', {
+                                taskId: requestedUuid,
+                                endpoint: '/task/new',
+                                actor: actor && actor.email,
+                                detail: existingJob.status
+                            });
+                            json(res, {error: `Task ${requestedUuid} was ${existingJob.status} and cannot be committed again.`});
+                            return;
+                        }
                         if (existingJob && existingJob.dispatchPhase === jobHistory.DISPATCH_PHASE.ROUTED){
                             logger.event('task.commit.duplicate', {
                                 taskId: requestedUuid,
@@ -833,6 +850,23 @@ module.exports = {
                         // later dies on validation.
                         const claim = jobHistory.tryAcceptCommit(uuid, {ownerKey: userToken});
                         if (!claim.accepted){
+                            // A canceled or deleted uuid is settled for good, not a
+                            // retry of something in flight: reporting {uuid} would
+                            // claim success for a body nobody will ever dispatch and
+                            // strand it in tmp. Only genuine in-flight or already
+                            // finished work answers idempotently.
+                            if (claim.reason === jobHistory.STATUS.DELETED ||
+                                claim.reason === jobHistory.STATUS.CANCELED){
+                                logger.event('task.commit.rejected', {
+                                    taskId: uuid,
+                                    endpoint: '/task/new',
+                                    actor: actor && actor.email,
+                                    detail: claim.reason
+                                });
+                                die(`Task ${uuid} was ${claim.reason} and cannot be committed again.`);
+                                return;
+                            }
+
                             logger.event('task.commit.duplicate', {
                                 taskId: uuid,
                                 reason: claim.reason,
@@ -842,6 +876,8 @@ module.exports = {
                             json(res, { uuid });
                             return;
                         }
+
+                        await claim.saved;
 
                         await jobHistory.record(uuid, 'created', {
                             ownerKey: userToken,

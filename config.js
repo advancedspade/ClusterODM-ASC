@@ -69,7 +69,7 @@ Options:
     --no-splitmerge	By default the program will set itself as being a cluster node for all split/merge tasks. Setting this option disables it. (default: false)
     --public-address <http(s)://host:port>	Should be set to a public URL that nodes can use to reach ClusterODM. (default: match the "host" header from client's HTTP request)
     --flood-limit <number>	Limit the number of simultaneous task uploads that a user can initiate concurrently (default: no limit)
-    --stale-uploads-timeout <number>	Delete temporary uploads if no activity is recorded for these many hours. Uploads belonging to a job that has not reached an outcome yet are exempt, so a commit that failed can still be resumed. (default: do not remove stale uploads)
+    --stale-uploads-timeout <number>	Delete temporary uploads if no activity is recorded for these many hours. Uploads that a client can still resume (a job in progress, or one that failed) are exempt and only expire at --tmp-max-age. (default: do not remove stale uploads)
     --tmp-max-age <number>	Hard cap in hours on how long a temporary upload is kept, and therefore how long a stranded upload stays resumable. (default: 48)
     --orphan-timeout <number>	Hours of silence after which a job with no route and no live dispatch is marked failed instead of showing as in progress forever. The worker is probed first. (default: 6)
     --token <token> Sets a token that needs to be passed for every request. This can be used to limit access to the node only to token holders. (default: none)

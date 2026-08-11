@@ -32,6 +32,33 @@ async function testRoutes(){
     assert.strictEqual(routes.isProtectedReferencePath("/task/new"), false);
 }
 
+// Route writes have to be durable before their caller moves on: a route that
+// only exists in memory leaves a task the gateway cannot proxy after a restart,
+// and a deletion that only happened in memory comes back to life.
+async function testRouteTableDurability(){
+    const routetable = require("../libs/routetable");
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "clusterodm-routes-"));
+    fs.mkdirSync(path.join(workDir, "data"));
+    const originalCwd = process.cwd();
+    process.chdir(workDir);
+
+    try{
+        await routetable.initialize();
+        const onDisk = () => JSON.parse(fs.readFileSync(path.join("data", "routes.json"), "utf8"));
+
+        const taskId = "77aa77aa-77aa-4aaa-8aaa-77aa77aa77aa";
+        await routetable.add(taskId, new Node("127.0.0.1", 4000, "worker-token"), "owner-a");
+        assert.deepStrictEqual(Object.keys(onDisk()), [taskId],
+                               "add must not resolve before the route is on disk");
+
+        await routetable.delete(taskId);
+        assert.deepStrictEqual(Object.keys(onDisk()), [],
+                               "delete must not resolve before the removal is on disk");
+    }finally{
+        process.chdir(originalCwd);
+    }
+}
+
 async function testAscOAuth(){
     const provider = new AscOAuthCloudProvider();
     process.env.OAUTH_ALLOWED_DOMAINS = "aspadeco.com,advancedspadecompany.com";
@@ -501,7 +528,9 @@ async function testRemoveWithoutRoute(){
 async function testCommitIdempotency(){
     const jobHistory = require("../libs/jobHistory");
     const uuid = "44444444-4444-4444-8444-444444444444";
-    await jobHistory.initialize(tempHistoryFile());
+    const historyFile = tempHistoryFile();
+    await jobHistory.initialize(historyFile);
+    const readLedger = () => JSON.parse(fs.readFileSync(historyFile, "utf8"));
 
     await jobHistory.record(uuid, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
 
@@ -512,6 +541,19 @@ async function testCommitIdempotency(){
     const second = jobHistory.tryAcceptCommit(uuid, {ownerKey: "owner-a"});
     assert.strictEqual(second.accepted, false, "a retried commit must not claim the task twice");
     assert.strictEqual(second.reason, "in-progress");
+
+    // A claim held only in memory is worthless: a restart before the write lands
+    // reloads a ledger with no claim and dispatches the same upload again.
+    await first.saved;
+    assert.strictEqual(readLedger().jobs[uuid].dispatchPhase, jobHistory.DISPATCH_PHASE.ACCEPTED,
+                       "the dispatch claim must be on disk once saved resolves");
+
+    // Same for the worker hint, which is written before the outbound commit so
+    // boot recovery can probe instead of releasing the claim.
+    await jobHistory.setDispatchNode(uuid, new Node("127.0.0.1", 4000, "worker-token"));
+    assert.deepStrictEqual(readLedger().jobs[uuid].worker,
+                           {hostname: "127.0.0.1", port: 4000, token: "worker-token"},
+                           "setDispatchNode must not resolve before the hint is on disk");
 
     await jobHistory.setDispatchPhase(uuid, jobHistory.DISPATCH_PHASE.ROUTED);
     assert.strictEqual(jobHistory.tryAcceptCommit(uuid).reason, "routed");
@@ -771,6 +813,36 @@ async function testDispatchClaimRecovery(){
         assert.strictEqual((await jobHistory.lookup(stranded)).dispatchPhase, null);
         assert.strictEqual(jobHistory.tryAcceptCommit(stranded).accepted, true,
                            "a claim with no recoverable worker must be resumable");
+
+        // An unreachable worker proves nothing. Releasing the claim on a startup
+        // timeout is exactly how a resume starts a second run of a task the worker
+        // may still be processing.
+        const unreachable = "56565656-5656-4565-8565-565656565656";
+        const dead = http.createServer(() => {});
+        await new Promise(resolve => dead.listen(0, "127.0.0.1", resolve));
+        const deadPort = dead.address().port;
+        await new Promise(resolve => dead.close(resolve));
+
+        await jobHistory.record(unreachable, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
+        jobHistory.tryAcceptCommit(unreachable, {ownerKey: "owner-a"});
+        await jobHistory.setDispatchPhase(unreachable, jobHistory.DISPATCH_PHASE.DISPATCHING);
+        await jobHistory.setDispatchNode(unreachable, new Node("127.0.0.1", deadPort, "worker-token"));
+
+        const held = await reconcile.recoverDispatchClaims();
+        assert.strictEqual(held.retained, 1, `expected the claim to be held, got ${JSON.stringify(held)}`);
+        assert.strictEqual((await jobHistory.lookup(unreachable)).dispatchPhase,
+                           jobHistory.DISPATCH_PHASE.DISPATCHING,
+                           "an inconclusive probe must not release a persisted worker claim");
+        assert.strictEqual(jobHistory.tryAcceptCommit(unreachable).accepted, false,
+                           "a held claim must keep absorbing resumes");
+
+        // Held only until a live run stops being plausible, or the uuid would be
+        // locked forever by a worker that never comes back.
+        (await jobHistory.lookup(unreachable)).updatedAt = new Date().getTime() - 1000 * 60 * 60 * 24;
+        const expired = await reconcile.recoverDispatchClaims();
+        assert.strictEqual(expired.retained, 0);
+        assert.strictEqual((await jobHistory.lookup(unreachable)).dispatchPhase, null,
+                           "a claim held past --orphan-timeout must be released");
     }finally{
         await new Promise(resolve => worker.close(resolve));
         process.chdir(originalCwd);
@@ -820,6 +892,30 @@ async function testLedgerAwareCleanup(){
         await new Promise(resolve => setTimeout(resolve, 500));
         assert.ok(!fs.existsSync(path.join("tmp", committed)),
                   "a settled job's upload must be removed once it ages out");
+
+        // A swept orphan sits at FAILED but is still offered for Resume, so the
+        // stale rule must leave it alone: only --tmp-max-age bounds that window.
+        const swept = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+        const succeeded = "abababab-abab-4bab-8bab-abababababab";
+        for (const uuid of [swept, succeeded]){
+            const dir = path.join("tmp", uuid);
+            fs.mkdirSync(dir);
+            fs.writeFileSync(path.join(dir, "body.json"), "{}");
+        }
+        await jobHistory.record(swept, "failed", {status: jobHistory.STATUS.FAILED, detail: "orphaned"});
+        await jobHistory.record(succeeded, "finished", {status: jobHistory.STATUS.SUCCEEDED});
+
+        // The first pass records the file count, the second compares it, which is
+        // when an unchanged upload can be called stale.
+        for (let i = 0; i < 2; i++){
+            await utils.cleanupTemporaryDirectory(1e-9, 72);
+            await new Promise(resolve => setTimeout(resolve, 300));
+        }
+
+        assert.ok(fs.existsSync(path.join("tmp", swept)),
+                  "a failed job's upload must outlive stale-uploads-timeout to stay resumable");
+        assert.ok(!fs.existsSync(path.join("tmp", succeeded)),
+                  "a succeeded job's upload must still be swept as stale");
     }finally{
         process.chdir(originalCwd);
     }
@@ -835,6 +931,7 @@ async function testReferenceNodeTokenRotation(){
 
 (async function(){
     await testRoutes();
+    await testRouteTableDurability();
     await testAscOAuth();
     await testGcpProvider();
     await testStorageObjectKey();
