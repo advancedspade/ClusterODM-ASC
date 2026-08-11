@@ -385,13 +385,22 @@ module.exports = {
      */
     toTaskInfo: function(record){
         const settled = TERMINAL.indexOf(record.status) !== -1;
+        const status = {code: record.statusCode || statusCodes.FAILED};
+
+        // Clients render errorMessage; without it a failure reads as a bare
+        // "Failed" with no reason once the worker is gone.
+        if (status.code === statusCodes.FAILED && record.status === STATUS.FAILED){
+            const last = record.events && record.events[record.events.length - 1];
+            if (last && last.detail) status.errorMessage = last.detail;
+        }
+
         return {
             uuid: record.uuid,
             name: record.name || record.uuid,
             dateCreated: record.createdAt,
             processingTime: (record.startedAt && record.finishedAt) ?
                                 record.finishedAt - record.startedAt : -1,
-            status: {code: record.statusCode || statusCodes.FAILED},
+            status,
             options: [],
             imagesCount: record.imagesCount || 0,
             progress: settled ? 100 : 0
@@ -471,6 +480,28 @@ module.exports = {
         scheduleSave();
 
         return job;
+    },
+
+    /**
+     * Records an outcome the worker reported, whether it arrived by webhook or
+     * by the reconciler probing for it. The action mirrors the outcome so the
+     * activity feed does not label a crash as "finished", and the worker's own
+     * error message becomes the detail the UI shows.
+     */
+    recordWorkerOutcome: async function(uuid, taskInfo, options = {}){
+        const status = (taskInfo && taskInfo.status) || {};
+        const action = status.code === statusCodes.FAILED ? 'failed' :
+                       status.code === statusCodes.CANCELED ? 'canceled' : 'finished';
+
+        return this.record(uuid, action, Object.assign({
+            statusCode: status.code,
+            name: taskInfo && taskInfo.name,
+            imagesCount: taskInfo && taskInfo.imagesCount,
+            detail: status.errorMessage || null,
+            // The worker is authoritative, so this overrides an optimistic
+            // cancel recorded while it was still running.
+            force: true
+        }, options));
     },
 
     lookup: async function(uuid){

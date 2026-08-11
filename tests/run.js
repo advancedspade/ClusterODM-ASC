@@ -567,10 +567,28 @@ async function testOrphanSweeper(){
     process.chdir(workDir);
     config.orphan_timeout = 1;
 
-    // Stands in for a worker whose route the gateway lost.
+    const routedFailed = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const routedMissing = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+
+    // Stands in for a worker whose route the gateway lost, plus a static routed
+    // worker that cannot send the autoscaler's completion webhook. It also
+    // answers /info, which is how the sweeper tells a live worker that dropped a
+    // task apart from a worker that is simply unreachable.
     const worker = http.createServer((req, res) => {
         res.writeHead(200, {"Content-Type": "application/json"});
-        res.end(JSON.stringify({uuid: "x", status: {code: statusCodes.RUNNING}}));
+
+        if (req.url.indexOf("/task/") !== 0){
+            res.end(JSON.stringify({version: "1.5.3"}));
+        }else if (req.url.indexOf(routedMissing) !== -1){
+            res.end(JSON.stringify({error: `${routedMissing} not found`}));
+        }else if (req.url.indexOf(routedFailed) !== -1){
+            res.end(JSON.stringify({
+                uuid: routedFailed,
+                status: {code: statusCodes.FAILED, errorMessage: "Cannot process dataset"}
+            }));
+        }else{
+            res.end(JSON.stringify({uuid: "x", status: {code: statusCodes.RUNNING}}));
+        }
     });
 
     try{
@@ -598,10 +616,14 @@ async function testOrphanSweeper(){
         await stale(dispatching);
         await stale(routed);
         await stale(alive);
+        await stale(routedFailed);
         await jobHistory.record(fresh, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
+        await jobHistory.record(routedMissing, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
 
         await tasktable.add(dispatching, {taskInfo: {uuid: dispatching}}, "owner-a");
         await routetable.add(routed, new Node("127.0.0.1", workerPort), "owner-a");
+        await routetable.add(routedFailed, new Node("127.0.0.1", workerPort), "owner-a");
+        await routetable.add(routedMissing, new Node("127.0.0.1", workerPort), "owner-a");
 
         // Route was dropped, but the worker is still there and must be believed
         // over the empty routing table.
@@ -612,18 +634,35 @@ async function testOrphanSweeper(){
         });
 
         const result = await reconcile.sweep();
-        assert.strictEqual(result.orphaned, 1, `expected exactly one orphan, got ${JSON.stringify(result)}`);
+        assert.strictEqual(result.orphaned, 2, `expected exactly two orphans, got ${JSON.stringify(result)}`);
 
         assert.strictEqual((await jobHistory.lookup(lost)).status, jobHistory.STATUS.FAILED);
         assert.ok((await jobHistory.lookup(lost)).events.some(e => /orphaned/.test(e.detail || "")));
         assert.strictEqual((await jobHistory.lookup(dispatching)).status, jobHistory.STATUS.QUEUED,
                            "a live dispatch must be left alone");
         assert.strictEqual((await jobHistory.lookup(routed)).status, jobHistory.STATUS.QUEUED,
-                           "a job with a live route must be left alone");
+                           "a running job with a live route must be left alone");
+        const settled = await jobHistory.lookup(routedFailed);
+        assert.strictEqual(settled.status, jobHistory.STATUS.FAILED,
+                           "a routed static-node task must settle without a webhook");
+
+        // A crash must not be filed as "finished", and the worker's own reason is
+        // the only thing that tells the user what went wrong.
+        const outcome = settled.events[settled.events.length - 1];
+        assert.strictEqual(outcome.action, "failed");
+        assert.strictEqual(outcome.detail, "Cannot process dataset");
+        assert.strictEqual(jobHistory.toTaskInfo(settled).status.errorMessage, "Cannot process dataset");
         assert.strictEqual((await jobHistory.lookup(alive)).status, jobHistory.STATUS.RUNNING,
                            "a reachable worker must heal the ledger, not fail it");
         assert.strictEqual((await jobHistory.lookup(fresh)).status, jobHistory.STATUS.QUEUED,
                            "a job younger than the threshold must be left alone");
+
+        // The "In progress forever" case: the worker is up and says it never had
+        // (or has lost) the task, so waiting out the orphan timeout is pointless.
+        assert.strictEqual((await jobHistory.lookup(routedMissing)).status, jobHistory.STATUS.FAILED,
+                           "a live worker that lost the task must settle it immediately");
+        assert.strictEqual(await routetable.lookup(routedMissing), null,
+                           "the dead route must go, or status reads keep hitting the worker");
     }finally{
         await new Promise(resolve => worker.close(resolve));
         process.chdir(originalCwd);

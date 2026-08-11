@@ -567,14 +567,8 @@ module.exports = {
                         const token = await routetable.lookupToken(taskId);
                         concurrencyMonitor.decreaseCount(token);
 
-                        // The worker is authoritative, so this overrides an
-                        // optimistic cancel recorded while it was still running.
-                        await jobHistory.record(taskId, 'finished', {
-                            ownerKey: token || undefined,
-                            statusCode: taskInfo.status ? taskInfo.status.code : undefined,
-                            name: taskInfo.name,
-                            imagesCount: taskInfo.imagesCount,
-                            force: true
+                        await jobHistory.recordWorkerOutcome(taskId, taskInfo, {
+                            ownerKey: token || undefined
                         });
 
                         try{

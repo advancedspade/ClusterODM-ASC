@@ -18,7 +18,7 @@
 "use strict";
 
 // Reconciles the durable ledger with what the gateway actually knows how to
-// reach. Two jobs, both run at boot and hourly:
+// reach. Both jobs run at boot and on a short interval:
 //
 //   1. Release dispatch claims stranded by a gateway that died mid-hand-off,
 //      otherwise a persisted claim would reject every retry and resume forever.
@@ -37,7 +37,9 @@ const statusCodes = require('./statusCodes');
 const Node = require('./classes/Node');
 
 const DEFAULT_ORPHAN_TIMEOUT_HOURS = 6;
-const SWEEP_INTERVAL = 1000 * 60 * 60;
+// Static processing nodes do not receive the autoscaler's completion webhook.
+// Poll routed tasks often enough that their UI status matches production.
+const SWEEP_INTERVAL = 1000 * 30;
 
 // Generous by default: a cold autoscale boot plus a large upload can legitimately
 // keep a job quiet for a long time, and a false "failed" is worse than a late one.
@@ -55,21 +57,39 @@ async function hasLiveDispatch(uuid){
     return false;
 }
 
+// NodeODM's wording when it has no record of a uuid. Node.taskInfo() flattens
+// transport failures and API errors into the same {error} shape, so the message
+// is the only signal that separates "worker is down" from "task is gone".
+const TASK_MISSING = /not found/i;
+
+async function workerAnswers(node){
+    const info = await node.getRequest('/info');
+    return !!(info && !info.error);
+}
+
 /**
  * Asks the last known worker whether it still has the task. routetable discards
  * routes whose node vanished from nodes.json, so a job with a healthy worker can
  * lose its route; failing it without asking would kill a running job's record.
  */
-async function probeWorker(job){
+async function probeWorker(job, routedNode = null){
     const hint = jobHistory.lastNodeHint(job);
-    if (!hint) return {reachable: false, registered: false, reason: 'no worker was ever assigned'};
+    if (!routedNode && !hint){
+        return {reachable: false, registered: false, reason: 'no worker was ever assigned'};
+    }
 
-    const registered = nodes.find(n => n.hostname() === hint.hostname && n.port() === hint.port);
+    const registered = routedNode || nodes.find(n => n.hostname() === hint.hostname && n.port() === hint.port);
     const node = registered || new Node(hint.hostname, hint.port);
 
     const info = await node.taskInfo(job.uuid);
     if (!info || info.error){
-        return {reachable: false, registered: !!registered, node, reason: (info && info.error) || 'no response'};
+        const reason = (info && info.error) || 'no response';
+
+        // A worker that still answers /info is healthy, so its verdict on a task
+        // it no longer holds is final rather than a network blip worth waiting out.
+        const taskGone = TASK_MISSING.test(reason) && await workerAnswers(node);
+
+        return {reachable: false, taskGone, registered: !!registered, node, reason};
     }
 
     return {reachable: true, registered: !!registered, node, info};
@@ -85,12 +105,17 @@ async function sweep(){
 
     for (const job of candidates){
         const age = now - (job.updatedAt || job.createdAt || now);
-        if (age < threshold) continue;
-        if (await hasLiveDispatch(job.uuid)) continue;
+        // In-memory task entries mean the gateway is still dispatching. Routed
+        // tasks are different: their worker may have reached a terminal state
+        // without a webhook, so they must be probed even while the route exists.
+        if (await tasktable.lookup(job.uuid)) continue;
+
+        const route = await routetable.lookup(job.uuid);
+        if (!route && age < threshold) continue;
 
         let probe;
         try{
-            probe = await probeWorker(job);
+            probe = await probeWorker(job, route && route.node);
         }catch(e){
             probe = {reachable: false, registered: false, reason: e.message};
         }
@@ -100,6 +125,8 @@ async function sweep(){
             const unfinished = [statusCodes.QUEUED, statusCodes.RUNNING].indexOf(code) !== -1;
 
             if (unfinished){
+                if (route) continue;
+
                 // Only restore a route we can actually persist; a node absent from
                 // nodes.json would be dropped again on the next reload.
                 if (probe.registered) await routetable.add(job.uuid, probe.node, job.ownerKey);
@@ -108,11 +135,9 @@ async function sweep(){
                     detail: `worker ${probe.node} still has this task`
                 });
             }else{
-                // The worker is authoritative about its own outcome.
-                await jobHistory.record(job.uuid, 'finished', {
-                    statusCode: code,
-                    force: true,
-                    detail: `recovered from worker ${probe.node}`
+                const status = probe.info.status || {};
+                await jobHistory.recordWorkerOutcome(job.uuid, probe.info, {
+                    detail: status.errorMessage || `reported by worker ${probe.node}`
                 });
             }
 
@@ -127,9 +152,19 @@ async function sweep(){
             continue;
         }
 
+        // A transient worker outage must not turn a healthy routed task into a
+        // failure. The same age threshold used for route-less orphans applies,
+        // unless the worker itself already told us the task is gone.
+        if (!probe.taskGone && age < threshold) continue;
+
+        // Leaving the route behind would keep proxying status reads to a worker
+        // that answers "not found", hiding the outcome we just recorded.
+        if (route) await routetable.delete(job.uuid);
+
         await jobHistory.record(job.uuid, 'failed', {
             status: jobHistory.STATUS.FAILED,
-            detail: 'orphaned - gateway lost track of this task'
+            detail: probe.taskGone ? `worker ${probe.node} no longer has this task`
+                                   : 'orphaned - gateway lost track of this task'
         });
         await jobHistory.clearDispatchPhase(job.uuid);
 

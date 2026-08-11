@@ -73,6 +73,29 @@ docker compose -f docker-compose.local.yml up --build
 
 Open http://localhost:3000 and sign in with an `@aspadeco.com` Google account.
 
+## Processing tasks locally
+
+Out of the box the gateway can serve the UI but not process: its only node is
+the **locked** reference node, and locked nodes never receive tasks. There is no
+`--asr` in the local compose either, so every commit fails with
+"No nodes available".
+
+To process, register the same NodeODM a second time as an unlocked node via the
+admin CLI:
+
+```bash
+docker exec -it clusterodm-asc-clusterodm-1 telnet localhost 8080
+NODE ADD host.docker.internal 4000 local-reference-node-token
+NODE LIST    # entry without [L] is the processing node
+```
+
+Nodes persist in `docker/data`, so this survives container restarts. Local ODM
+runs on CPU with `NODEODM_LOCAL_CPU=1` defaults — keep datasets small. Static
+nodes do not send the autoscaler's completion webhook; the gateway probes routed
+tasks every 30 seconds so completed and failed outcomes still appear in Projects
+like they do in production. If NodeODM restarts mid-task it loses the task, and
+the probe settles the job as failed instead of leaving it "In progress".
+
 ## Verify
 
 ```bash
@@ -119,6 +142,8 @@ Leave `SUPPORT_API_URL` unset to hide both buttons.
 - **"Cloud storage is not connected."** ADC expired — re-run
   `gcloud auth application-default login` and recreate the NodeODM container with
   `--force-recreate`.
+- **Commit fails with "No nodes available".** Only the locked reference node is
+  registered. See "Processing tasks locally" above.
 
 ## Running NodeODM standalone (no gateway)
 

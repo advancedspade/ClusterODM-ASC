@@ -72,6 +72,13 @@ module.exports = {
         return null;
     },
 
+    delete: async function(taskId){
+        if (!routes[taskId]) return;
+
+        delete(routes[taskId]);
+        this.saveToDisk();
+    },
+
     removeByNode: async function(node){
         if (!node) return;
 
