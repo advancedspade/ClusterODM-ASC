@@ -1,6 +1,25 @@
 {
 	# Keep the admin API inside the container.
 	admin localhost:2019
+
+	servers {
+		timeouts {
+			# A 400-image batch legitimately streams for many minutes. Any finite
+			# read_body/write here surfaces to the browser as xhr.status === 0
+			# with no server-side trace, which is exactly the failure mode that
+			# strands an upload at commit.
+			read_body 0
+			read_header 30s
+			write 0
+			idle 10m
+		}
+
+		# Set GATEWAY_HTTP_PROTOCOLS="h1 h2" to stop advertising Alt-Svc so
+		# browsers fall back to TCP. QUIC plus multi-minute upload streams is an
+		# unproven but plausible contributor to dropped commits; measure on dev
+		# before touching prod.
+		protocols {$GATEWAY_HTTP_PROTOCOLS:h1 h2 h3}
+	}
 }
 
 {$GATEWAY_HOSTNAME} {
@@ -21,5 +40,20 @@
 		Referrer-Policy "strict-origin-when-cross-origin"
 	}
 
-	log
+	# JSON to stdout so the gcplogs driver ships it as structured data: a commit
+	# that never reached ClusterODM is only attributable from Caddy's side.
+	# Strip ?token= even though the OAuth UI usually leaves it empty — ClusterODM
+	# still accepts query-token auth for legacy clients, and that value must not
+	# land in Cloud Logging for every logging.viewer.
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>uri query {
+					delete token
+				}
+			}
+		}
+	}
 }

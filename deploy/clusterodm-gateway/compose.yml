@@ -77,6 +77,11 @@ services:
       - "0"
       - --stale-uploads-timeout
       - "24"
+      # 72h keeps a Friday-evening commit failure resumable on Monday morning.
+      - --tmp-max-age
+      - "72"
+      - --orphan-timeout
+      - "6"
       - --no-splitmerge
     environment:
       SESSION_SECRET: ${SESSION_SECRET}
@@ -124,9 +129,12 @@ services:
         condition: service_healthy
     environment:
       GATEWAY_HOSTNAME: ${GATEWAY_HOSTNAME}
+      GATEWAY_HTTP_PROTOCOLS: ${GATEWAY_HTTP_PROTOCOLS:-h1 h2 h3}
     ports:
       - "80:80"
       - "443:443"
+      # Harmless when GATEWAY_HTTP_PROTOCOLS omits h3: without Alt-Svc no
+      # browser dials QUIC, so the protocol list is the only knob needed.
       - "443:443/udp"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro

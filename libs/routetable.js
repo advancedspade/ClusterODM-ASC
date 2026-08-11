@@ -20,12 +20,28 @@ const async = require("async");
 const logger = require('./logger');
 const nodes = require('./nodes');
 
+const ROUTES_FILE = 'data/routes.json';
+
 let routes = null;
+let writeChain = Promise.resolve();
 
 // TODO: use redis to have a shared routing table
 // accessible from multiple proxies
 
 // The route table maps taskIDs to nodes and task owners (via token)
+
+// Route mutations must be on disk before their caller acts on them: a route left
+// only in memory turns a restart into a task the gateway cannot proxy, and a
+// deletion left only in memory comes back to life. Write failures are logged by
+// saveToDisk and swallowed here — they are not worth failing an operation that
+// already succeeded, and an unhandled rejection would take the gateway down.
+async function persist(){
+    try{
+        await module.exports.saveToDisk();
+    }catch(e){
+        // Already logged by saveToDisk.
+    }
+}
 
 module.exports = {
     initialize: async function(){
@@ -40,7 +56,7 @@ module.exports = {
                 }
             });
 
-            this.saveToDisk();
+            persist();
         };
 
         cleanup();
@@ -59,7 +75,7 @@ module.exports = {
             accessed: new Date().getTime()
         };
 
-        this.saveToDisk();
+        await persist();
     },
 
     lookup: async function(taskId){
@@ -72,6 +88,13 @@ module.exports = {
         return null;
     },
 
+    delete: async function(taskId){
+        if (!routes[taskId]) return;
+
+        delete(routes[taskId]);
+        await persist();
+    },
+
     removeByNode: async function(node){
         if (!node) return;
 
@@ -80,7 +103,7 @@ module.exports = {
             delete(routes[taskId]);
         }
 
-        this.saveToDisk();
+        await persist();
     },
 
     findByNode: async function(node = null){
@@ -152,24 +175,31 @@ module.exports = {
         return null;
     },
 
+    // Serialized through writeChain and committed by rename, so two concurrent
+    // route changes cannot interleave chunks and leave a truncated routes.json
+    // that loses every route on the next boot.
     saveToDisk: async function(){
-        return new Promise((resolve, reject) => {
-            fs.writeFile('data/routes.json', JSON.stringify(routes), (err) => {
-                if (err){
-                    logger.warn(`Cannot save routes to disk: ${err.message}`);
-                    reject(err);
-                }else{
-                    resolve();
-                }
-            });
+        const payload = JSON.stringify(routes);
+        const tmpFile = `${ROUTES_FILE}.${process.pid}.tmp`;
+
+        const write = writeChain
+            .then(() => fs.promises.writeFile(tmpFile, payload))
+            .then(() => fs.promises.rename(tmpFile, ROUTES_FILE));
+
+        // The chain itself must stay resolvable, or one failed write poisons
+        // every write after it. The failure still reaches this caller.
+        writeChain = write.catch(err => {
+            logger.warn(`Cannot save routes to disk: ${err.message}`);
         });
+
+        return write;
     },
 
     loadFromDisk: async function(){
         return new Promise((resolve, reject) => {
-            fs.exists("data/routes.json", (exists) => {
+            fs.exists(ROUTES_FILE, (exists) => {
                 if (exists){
-                    fs.readFile("data/routes.json", (err, json) => {
+                    fs.readFile(ROUTES_FILE, (err, json) => {
                         if (err){
                             logger.warn(`Cannot read routes from disk: ${err.message}`);
                             reject(err);

@@ -30,6 +30,7 @@ const utils = require('./utils');
 const routetable = require('./routetable');
 const tasktable = require('./tasktable');
 const jobHistory = require('./jobHistory');
+const reconcile = require('./reconcile');
 const logger = require('./logger');
 const accessLog = require('./accessLog');
 const statusCodes = require('./statusCodes');
@@ -43,17 +44,79 @@ const AWS = require('aws-sdk');
 const ascUiRoutes = require('./ascUiRoutes');
 const {sanitizeProjectName} = require('./gcsProjectName');
 const querystring = require('querystring');
+const events = require('events');
+
+// Set by initialize() so the admin CLI can drive a commit and inspect stranded
+// uploads without going through an HTTP client.
+let commitFromAdmin = null;
+let listPendingFromAdmin = null;
+
+// Stands in for an http.ServerResponse when a commit is triggered out of band.
+// It emits 'finish' so the same lifecycle logging applies to an admin resume.
+function collectorResponse(){
+    const res = new events.EventEmitter();
+    res.statusCode = 200;
+    res.body = null;
+    res.writableFinished = false;
+    res.setHeader = () => {};
+    res.writeHead = (code) => { res.statusCode = code; return res; };
+    res.end = (data) => {
+        res.body = data;
+        res.writableFinished = true;
+        res.emit('finish');
+    };
+    return res;
+}
 
 module.exports = {
+    /**
+     * Re-runs the commit for an upload the gateway still has on disk. Same code
+     * path (and therefore same idempotency guarantees) as the HTTP endpoint.
+     */
+    resumeTask: async function(taskId){
+        if (!utils.isTaskUuid(taskId)) throw new Error("Invalid taskId");
+        if (!commitFromAdmin) throw new Error("Proxy is not initialized yet");
+
+        const job = await jobHistory.lookup(taskId);
+        const res = collectorResponse();
+        const req = Object.assign(new events.EventEmitter(), {
+            headers: {host: `localhost:${config.port}`},
+            clusterAuthToken: (job && job.ownerKey) || config.token || ""
+        });
+
+        await commitFromAdmin({
+            req,
+            res,
+            taskId,
+            userToken: (job && job.ownerKey) || undefined,
+            actor: {source: 'admin'},
+            limits: {}
+        });
+
+        try{
+            return JSON.parse(res.body);
+        }catch(e){
+            return {error: `Unexpected commit response: ${res.body}`};
+        }
+    },
+
+    pendingUploads: async function(){
+        if (!listPendingFromAdmin) throw new Error("Proxy is not initialized yet");
+        return listPendingFromAdmin(null);
+    },
+
     initialize: async function(cloudProvider){
-        utils.cleanupTemporaryDirectory(config.stale_uploads_timeout);
         await routetable.initialize();
         await tasktable.initialize();
         await jobHistory.initialize();
 
+        // Cleanup consults the ledger, so it only runs once the ledger is loaded.
+        utils.cleanupTemporaryDirectory(config.stale_uploads_timeout, config.tmp_max_age);
         setInterval(() => {
-            utils.cleanupTemporaryDirectory(config.stale_uploads_timeout);
+            utils.cleanupTemporaryDirectory(config.stale_uploads_timeout, config.tmp_max_age);
         }, 1000 * 60 * 30);
+
+        await reconcile.initialize();
 
         // Allow index, .css and .js files to be retrieved from nodes
         // without authentication
@@ -138,6 +201,42 @@ module.exports = {
             });
         };
 
+        const getCappedReqBody = async (req, maxBytes) => {
+            return new Promise((resolve, reject) => {
+                let size = 0;
+                const chunks = [];
+                req.on('data', chunk => {
+                    size += chunk.length;
+                    if (size > maxBytes){
+                        req.destroy();
+                        reject(new Error(`body exceeds ${maxBytes} bytes`));
+                        return;
+                    }
+                    chunks.push(chunk);
+                });
+                req.on('end', () => resolve(Buffer.concat(chunks).toString()));
+                req.on('error', reject);
+            });
+        };
+
+        // Emits once per response. `outcome` is what tells a commit the client
+        // never received apart from one the gateway never answered.
+        const trackResponse = (res, event, fields) => {
+            const startedAt = new Date().getTime();
+            let emitted = false;
+            const emit = (outcome) => {
+                if (emitted) return;
+                emitted = true;
+                logger.event(event, Object.assign({}, fields, {
+                    durationMs: new Date().getTime() - startedAt,
+                    outcome
+                }));
+            };
+
+            res.once('finish', () => emit('responded'));
+            res.once('close', () => emit(res.writableFinished ? 'responded' : 'aborted'));
+        };
+
         // Replace token 
         const overrideRequest = (req, node, query, pathname) => {
             if (node.getToken()){
@@ -149,6 +248,239 @@ module.exports = {
             }
 
             req.url = url.format({ query, pathname });
+        };
+
+        // Uploads that finished but were never handed to a worker. This is what
+        // makes a commit lost to a dropped connection visible and resumable
+        // instead of invisible until the retention window deletes it.
+        const listPendingUploads = async (userToken) => {
+            let entries = [];
+            try{
+                entries = await fs.promises.readdir('tmp');
+            }catch(e){
+                logger.warn(`Cannot list pending uploads: ${e.message}`);
+                return [];
+            }
+
+            const now = new Date().getTime();
+            const pending = [];
+
+            for (const entry of entries){
+                if (!utils.isTaskUuid(entry)) continue;
+
+                const tmpPath = path.join('tmp', entry);
+                let files, stats, body;
+                try{
+                    stats = await fs.promises.stat(tmpPath);
+                    if (!stats.isDirectory()) continue;
+                    files = await fs.promises.readdir(tmpPath);
+                    if (files.indexOf('body.json') === -1) continue;
+                    body = JSON.parse(await fs.promises.readFile(path.join(tmpPath, 'body.json'), 'utf8'));
+                }catch(e){
+                    continue;
+                }
+
+                // Anything the gateway is still working on is not stranded.
+                if (await routetable.lookup(entry)) continue;
+                if (await tasktable.lookup(entry)) continue;
+                if (await jobHistory.hasActiveDispatch(entry)) continue;
+
+                const job = await jobHistory.lookup(entry);
+                if (job){
+                    if (job.ownerKey && userToken && job.ownerKey !== userToken) continue;
+
+                    if (!jobHistory.isResumable(job)) continue;
+                }
+
+                const createdAt = (job && job.createdAt) || stats.mtime.getTime();
+                pending.push({
+                    uuid: entry,
+                    name: (job && job.name) || body.taskName || null,
+                    imagesCount: files.filter(f => f.toLowerCase() !== 'body.json').length,
+                    createdAt,
+                    ageMs: now - createdAt,
+                    status: (job && job.status) || null
+                });
+            }
+
+            return pending.sort((a, b) => b.createdAt - a.createdAt);
+        };
+
+        /**
+         * Hands an uploaded task to a worker. Idempotent: a client that never saw
+         * the response can POST the same commit again and gets the original uuid
+         * back rather than starting a second run.
+         */
+        const commitTask = async ({ req, res, taskId, userToken, actor, limits }) => {
+            const tmpPath = path.join('tmp', taskId);
+            const bodyFile = path.join(tmpPath, 'body.json');
+            const actorEmail = actor && actor.email;
+
+            logger.event('task.commit.received', {taskId, actor: actorEmail});
+            trackResponse(res, 'task.commit.responded', {taskId, actor: actorEmail});
+
+            const duplicate = (reason, extra = {}) => {
+                logger.event('task.commit.duplicate', Object.assign({taskId, reason, actor: actorEmail}, extra));
+                json(res, {uuid: taskId});
+            };
+
+            const die = async (err) => {
+                await jobHistory.record(taskId, 'failed', {
+                    ownerKey: userToken,
+                    actor,
+                    status: jobHistory.STATUS.FAILED,
+                    detail: err
+                });
+                logger.event('task.failed', {taskId, actor: actorEmail, detail: err});
+                utils.rmdir(tmpPath);
+                asrProvider.cleanup(taskId);
+                json(res, {error: err});
+            };
+
+            // Early exits that mean "this upload is already spoken for" must run
+            // before concurrency accounting, so a retry does not burn the
+            // per-minute commit budget reserved for genuinely new tasks. The
+            // ledger claim itself waits until validation succeeds: otherwise a
+            // concurrent retry can be told {uuid} while the winner later rejects
+            // and clears the phase.
+            const routedNode = await routetable.lookupNode(taskId);
+            if (routedNode){
+                duplicate('routed', {node: String(routedNode)});
+                return;
+            }
+            if (await tasktable.lookup(taskId)){
+                duplicate('dispatching');
+                return;
+            }
+            if (await jobHistory.hasActiveDispatch(taskId)){
+                duplicate('in-progress');
+                return;
+            }
+            const existing = await jobHistory.lookup(taskId);
+            if (existing && existing.dispatchPhase === jobHistory.DISPATCH_PHASE.ROUTED){
+                duplicate('routed');
+                return;
+            }
+            if (existing && (existing.status === jobHistory.STATUS.DELETED ||
+                             existing.status === jobHistory.STATUS.CANCELED)){
+                logger.event('task.commit.rejected', {taskId, actor: actorEmail, detail: existing.status});
+                json(res, {error: `Task ${taskId} was ${existing.status} and cannot be committed again.`});
+                return;
+            }
+            if (existing && existing.status === jobHistory.STATUS.SUCCEEDED){
+                duplicate('succeeded');
+                return;
+            }
+
+            if (!fs.existsSync(bodyFile)){
+                logger.event('task.commit.rejected', {taskId, actor: actorEmail, detail: 'missing upload'});
+                json(res, {error: `Cannot commit task ${taskId}: its uploaded files are no longer available. Please upload again.`});
+                return;
+            }
+
+            if (concurrencyMonitor.checkCommitLimitReached(limits.maxConcurrentTasks, userToken)){
+                logger.event('task.commit.rejected', {taskId, actor: actorEmail, detail: 'commit limit'});
+                json(res, {error: `Reached maximum number of concurrent tasks, please wait until other tasks have finished, then restart the task.`});
+                return;
+            }
+
+            if (await maxConcurrencyLimitReached(limits.maxConcurrentTasks, userToken)){
+                logger.event('task.commit.rejected', {taskId, actor: actorEmail, detail: 'concurrency limit'});
+                json(res, {error: `Reached maximum number of concurrent tasks. Please wait until other tasks have finished, then restart the task.`});
+                return;
+            }
+
+            let body, files;
+            try{
+                body = JSON.parse(await fs.promises.readFile(bodyFile, 'utf8'));
+                files = (await fs.promises.readdir(tmpPath)).filter(f => f.toLowerCase() !== 'body.json');
+            }catch(e){
+                logger.event('task.commit.rejected', {taskId, actor: actorEmail, detail: e.message});
+                json(res, {error: `Cannot commit task: ${e.message}`});
+                return;
+            }
+
+            body.fileNames = files;
+            body.imagesCount = files.length;
+
+            const claim = jobHistory.tryAcceptCommit(taskId, {ownerKey: userToken});
+            if (!claim.accepted){
+                if (claim.reason === jobHistory.STATUS.DELETED || claim.reason === jobHistory.STATUS.CANCELED){
+                    logger.event('task.commit.rejected', {taskId, actor: actorEmail, detail: claim.reason});
+                    json(res, {error: `Task ${taskId} was ${claim.reason} and cannot be committed again.`});
+                }else{
+                    duplicate(claim.reason);
+                }
+                return;
+            }
+
+            // Nothing may observe the claim before it is durable: a restart
+            // between here and the worker hand-off would reload a ledger with no
+            // claim and dispatch this same upload a second time.
+            await claim.saved;
+
+            floodMonitor.recordTaskCommit(userToken);
+            utils.markTaskAsCommitted(taskId);
+
+            await jobHistory.record(taskId, 'uploaded', {
+                ownerKey: userToken,
+                actor,
+                name: body.taskName,
+                imagesCount: body.imagesCount,
+                // Resuming a swept orphan has to move it off `failed` explicitly,
+                // since the ledger otherwise refuses to walk a settled job back.
+                status: claim.revived ? jobHistory.STATUS.QUEUED : undefined,
+                allowRevive: claim.revived
+            });
+
+            logger.event('task.commit.accepted', {
+                taskId,
+                actor: actorEmail,
+                imagesCount: body.imagesCount,
+                name: body.taskName,
+                resumed: claim.revived
+            });
+
+            try{
+                await taskNew.process(req, res, cloudProvider, taskId, body, userToken, limits, getLimitedOptions, actor);
+            }catch(e){
+                await die(e.message);
+            }
+        };
+
+        // Client-side diagnostics. Capped and rate limited because this is reachable
+        // from a public host, even though it sits behind the auth gate.
+        const CLIENT_DIAG_MAX_BODY = 8 * 1024;
+        const CLIENT_DIAG_WINDOW = 5 * 60 * 1000;
+        const CLIENT_DIAG_MAX_REPORTS = 30;
+        const clientDiagHits = {};
+
+        const clientDiagAllowed = (token) => {
+            const key = token || 'anonymous';
+            const now = new Date().getTime();
+
+            Object.keys(clientDiagHits).forEach(k => {
+                clientDiagHits[k] = clientDiagHits[k].filter(t => now - t < CLIENT_DIAG_WINDOW);
+                if (!clientDiagHits[k].length) delete clientDiagHits[k];
+            });
+
+            const hits = clientDiagHits[key] || (clientDiagHits[key] = []);
+            hits.push(now);
+            return hits.length <= CLIENT_DIAG_MAX_REPORTS;
+        };
+
+        commitFromAdmin = commitTask;
+        listPendingFromAdmin = listPendingUploads;
+
+        const clipField = (value, maxLength) => {
+            if (value === undefined || value === null) return null;
+            const str = String(value).replace(/[\r\n]+/g, ' ');
+            return str.length > maxLength ? str.slice(0, maxLength) : str;
+        };
+
+        const numberField = (value) => {
+            const num = Number(value);
+            return Number.isFinite(num) ? num : null;
         };
 
         const proxy = new HttpProxy();
@@ -256,14 +588,8 @@ module.exports = {
                         const token = await routetable.lookupToken(taskId);
                         concurrencyMonitor.decreaseCount(token);
 
-                        // The worker is authoritative, so this overrides an
-                        // optimistic cancel recorded while it was still running.
-                        await jobHistory.record(taskId, 'finished', {
-                            ownerKey: token || undefined,
-                            statusCode: taskInfo.status ? taskInfo.status.code : undefined,
-                            name: taskInfo.name,
-                            imagesCount: taskInfo.imagesCount,
-                            force: true
+                        await jobHistory.recordWorkerOutcome(taskId, taskInfo, {
+                            ownerKey: token || undefined
                         });
 
                         try{
@@ -376,6 +702,12 @@ module.exports = {
                                     status: jobHistory.STATUS.QUEUED
                                 });
 
+                                logger.event('task.init', {
+                                    taskId: uuid,
+                                    actor: actor && actor.email,
+                                    name: params.taskName || null
+                                });
+
                                 // All good
                                 json(res, { uuid });
                             }
@@ -420,89 +752,78 @@ module.exports = {
                                 taskNew.formDataParser(req, function(params){
                                     if (!params.imagesCount) cb(new Error("No files uploaded."));
                                     else if (params.error) cb(new Error(params.error));
-                                    else cb();
+                                    else cb(null, params.imagesCount);
                                 }, { saveFilesToDir, parseFields: false});
                             }
-                        ], err => {
-                            if (err) json(res, {error: err.message});
-                            else json(res, {success: true});
+                        ], (err, results) => {
+                            if (err){
+                                logger.event('task.upload.batch', {
+                                    taskId,
+                                    actor: actor && actor.email,
+                                    detail: err.message,
+                                    level: 'warn'
+                                });
+                                json(res, {error: err.message});
+                            }else{
+                                logger.event('task.upload.batch', {
+                                    taskId,
+                                    actor: actor && actor.email,
+                                    batchCount: results[results.length - 1] || 0,
+                                    level: 'debug'
+                                });
+                                json(res, {success: true});
+                            }
                         });
                     }else json(res, { error: `No uuid found in ${pathname}`});
                 }else if (req.method === 'POST' && pathname.indexOf('/task/new/commit') === 0){
                     const taskId = taskNew.getTaskIdFromPath(pathname);
-                    if (taskId){
-                        const tmpPath = path.join('tmp', taskId);
-                        const bodyFile = path.join(tmpPath, 'body.json');
-                        const die = (err) => {
-                            utils.rmdir(tmpPath);
-                            utils.json(res, {error: err});
-                            asrProvider.cleanup(taskId);
-                            jobHistory.record(taskId, 'failed', {
-                                ownerKey: userToken,
-                                actor,
-                                status: jobHistory.STATUS.FAILED,
-                                detail: err
-                            });
-                        };
-
-                        if (concurrencyMonitor.checkCommitLimitReached(limits.maxConcurrentTasks, userToken)){
-                            die(`Reached maximum number of concurrent tasks, please wait until other tasks have finished, then restart the task.`);
-                            return;
-                        }
-
-                        if (await maxConcurrencyLimitReached(limits.maxConcurrentTasks, userToken)){
-                            die(`Reached maximum number of concurrent tasks. Please wait until other tasks have finished, then restart the task.`);
-                            return;
-                        }
-
-
-                        floodMonitor.recordTaskCommit(userToken);
-                        utils.markTaskAsCommitted(taskId);
-
-                        async.series([
-                            cb => {
-                                fs.readFile(bodyFile, 'utf8', (err, data) => {
-                                    if (err) cb(err);
-                                    else{
-                                        try{
-                                            const body = JSON.parse(data);
-                                            cb(null, body);
-                                        }catch(e){
-                                            cb(new Error(`Cannot commit task ${e.message}`));
-                                        }
-                                    }
-                                });
-                            },
-
-                            cb => {
-                                fs.readdir(tmpPath, (err, files) => {
-                                    if (err) cb(err);
-                                    else cb(null, files.filter(f => f.toLowerCase() !== "body.json"));
-                                });
-                            }
-                        ], async (err, [ body, files ]) => {
-                            if (err) json(res, {error: err.message});
-                            else{
-                                body.fileNames = files;
-                                body.imagesCount = files.length;
-
-                                await jobHistory.record(taskId, 'uploaded', {
-                                    ownerKey: userToken,
-                                    actor,
-                                    name: body.taskName,
-                                    imagesCount: body.imagesCount
-                                });
-
-                                try{
-                                    await taskNew.process(req, res, cloudProvider, taskId, body, userToken, limits, getLimitedOptions, actor);
-                                }catch(e){
-                                    die(e.message);
-                                    return;
-                                }
-                            }
-                        });
-                    }else json(res, { error: `No uuid found in ${pathname}`});
+                    if (taskId) await commitTask({ req, res, taskId, userToken, actor, limits });
+                    else json(res, { error: `No uuid found in ${pathname}`});
                 }else if (req.method === 'POST' && pathname === '/task/new') {
+                    // Absorb set-uuid retries before createContext: getUuid() would
+                    // otherwise reject any uuid already in tasktable/routetable as a
+                    // collision, which is exactly the idempotent retry we want to keep.
+                    const requestedUuid = req.headers['set-uuid'];
+                    if (requestedUuid && utils.isTaskUuid(requestedUuid)){
+                        if (await routetable.lookup(requestedUuid) ||
+                            await tasktable.lookup(requestedUuid) ||
+                            await jobHistory.hasActiveDispatch(requestedUuid)){
+                            logger.event('task.commit.duplicate', {
+                                taskId: requestedUuid,
+                                reason: 'in-progress',
+                                endpoint: '/task/new',
+                                actor: actor && actor.email
+                            });
+                            json(res, {uuid: requestedUuid});
+                            return;
+                        }
+                        const existingJob = await jobHistory.lookup(requestedUuid);
+                        // Canceled and deleted are final. Say so before reading the
+                        // body, or the client uploads an entire task to a uuid that
+                        // can never be dispatched.
+                        if (existingJob && (existingJob.status === jobHistory.STATUS.DELETED ||
+                                            existingJob.status === jobHistory.STATUS.CANCELED)){
+                            logger.event('task.commit.rejected', {
+                                taskId: requestedUuid,
+                                endpoint: '/task/new',
+                                actor: actor && actor.email,
+                                detail: existingJob.status
+                            });
+                            json(res, {error: `Task ${requestedUuid} was ${existingJob.status} and cannot be committed again.`});
+                            return;
+                        }
+                        if (existingJob && existingJob.dispatchPhase === jobHistory.DISPATCH_PHASE.ROUTED){
+                            logger.event('task.commit.duplicate', {
+                                taskId: requestedUuid,
+                                reason: 'routed',
+                                endpoint: '/task/new',
+                                actor: actor && actor.email
+                            });
+                            json(res, {uuid: requestedUuid});
+                            return;
+                        }
+                    }
+
                     let ctx = null;
                     try{
                         ctx = await taskNew.createContext(req, res);
@@ -524,12 +845,58 @@ module.exports = {
                             return;
                         }
 
+                        // Claim only after the body parsed and quota cleared, so a
+                        // concurrent retry is not told {uuid} for an attempt that
+                        // later dies on validation.
+                        const claim = jobHistory.tryAcceptCommit(uuid, {ownerKey: userToken});
+                        if (!claim.accepted){
+                            // A canceled or deleted uuid is settled for good, not a
+                            // retry of something in flight: reporting {uuid} would
+                            // claim success for a body nobody will ever dispatch and
+                            // strand it in tmp. Only genuine in-flight or already
+                            // finished work answers idempotently.
+                            if (claim.reason === jobHistory.STATUS.DELETED ||
+                                claim.reason === jobHistory.STATUS.CANCELED){
+                                logger.event('task.commit.rejected', {
+                                    taskId: uuid,
+                                    endpoint: '/task/new',
+                                    actor: actor && actor.email,
+                                    detail: claim.reason
+                                });
+                                die(`Task ${uuid} was ${claim.reason} and cannot be committed again.`);
+                                return;
+                            }
+
+                            logger.event('task.commit.duplicate', {
+                                taskId: uuid,
+                                reason: claim.reason,
+                                endpoint: '/task/new',
+                                actor: actor && actor.email
+                            });
+                            json(res, { uuid });
+                            return;
+                        }
+
+                        await claim.saved;
+
                         await jobHistory.record(uuid, 'created', {
                             ownerKey: userToken,
                             actor,
                             name: params.taskName,
                             imagesCount: params.imagesCount,
                             status: jobHistory.STATUS.QUEUED
+                        });
+
+                        logger.event('task.commit.received', {
+                            taskId: uuid,
+                            actor: actor && actor.email,
+                            imagesCount: params.imagesCount,
+                            endpoint: '/task/new'
+                        });
+                        trackResponse(res, 'task.commit.responded', {
+                            taskId: uuid,
+                            actor: actor && actor.email,
+                            endpoint: '/task/new'
                         });
 
                         try{
@@ -539,6 +906,12 @@ module.exports = {
                                 ownerKey: userToken,
                                 actor,
                                 status: jobHistory.STATUS.FAILED,
+                                detail: e.message
+                            });
+                            logger.event('task.failed', {
+                                taskId: uuid,
+                                actor: actor && actor.email,
+                                endpoint: '/task/new',
                                 detail: e.message
                             });
                             die(e.message);
@@ -661,6 +1034,41 @@ module.exports = {
                         success: !!project,
                         project
                     });
+                }else if (req.method === 'GET' && pathname === '/task/pending') {
+                    json(res, { pending: await listPendingUploads(userToken) });
+                }else if (req.method === 'POST' && pathname === '/diag/client') {
+                    if (!clientDiagAllowed(userToken)){
+                        res.writeHead(429, {"Content-Type": "application/json"});
+                        res.end(JSON.stringify({error: "Too many diagnostic reports"}));
+                        return;
+                    }
+
+                    let report;
+                    try{
+                        report = JSON.parse(await getCappedReqBody(req, CLIENT_DIAG_MAX_BODY));
+                        if (!report || typeof report !== 'object') throw new Error("expected a JSON object");
+                    }catch(e){
+                        json(res, {error: `Invalid diagnostic report: ${e.message}`});
+                        return;
+                    }
+
+                    logger.event('client.error', {
+                        taskId: utils.isTaskUuid(report.taskId) ? report.taskId : null,
+                        actor: actor && actor.email,
+                        message: clipField(report.message, 500),
+                        endpoint: clipField(report.endpoint, 300),
+                        phase: clipField(report.phase, 60),
+                        status: numberField(report.status),
+                        attempt: numberField(report.attempt),
+                        elapsedMs: numberField(report.elapsedMs),
+                        sessionMs: numberField(report.sessionMs),
+                        imagesCount: numberField(report.imagesCount),
+                        connection: clipField(report.connection, 40),
+                        userAgent: clipField(report.userAgent, 300),
+                        source: clipField(report.source, 60)
+                    });
+
+                    json(res, {ok: true});
                 }else if (req.method === 'GET' && pathname === '/task/history') {
                     const includeDeleted = ['0', 'false'].indexOf(String(query.include_deleted)) === -1;
                     json(res, {

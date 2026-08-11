@@ -22,6 +22,7 @@ const nodes = require('./libs/nodes');
 const routetable = require('./libs/routetable');
 const netutils = require('./libs/netutils');
 const asrProvider = require('./libs/asrProvider');
+const reconcile = require('./libs/reconcile');
 
 module.exports = {
     create: function(options){
@@ -115,6 +116,9 @@ module.exports = {
                         socket.write("TASK OUTPUT <taskId> [lines] - View task output\r\n");
                         socket.write("TASK CANCEL <taskId> - Cancel task\r\n");
                         socket.write("TASK REMOVE <taskId> - Remove task\r\n");
+                        socket.write("TASK PENDING - List uploads that were never handed to a worker\r\n");
+                        socket.write("TASK RESUME <taskId> - Commit a pending upload again\r\n");
+                        socket.write("TASK ORPHANS - List jobs the gateway has lost track of\r\n");
                         socket.write("ASR VIEWCMD <number of images> - View command used to create a machine\r\n");
                         socket.write("!! - Repeat last command\r\n");
                     }else if (command === "NODE" && args.length > 0){
@@ -212,6 +216,21 @@ module.exports = {
                                     jsonResponse(taskOutput);
                                 }
                             }
+                        }else if (subcommand === "PENDING"){
+                            try{
+                                jsonResponse(await require('./libs/proxy').pendingUploads());
+                            }catch(e){
+                                socket.write(`${e.message}\r\n`);
+                            }
+                        }else if (subcommand === "RESUME" && args.length >= 1){
+                            const [ taskId ] = args;
+                            try{
+                                jsonResponse(await require('./libs/proxy').resumeTask(taskId));
+                            }catch(e){
+                                socket.write(`${e.message}\r\n`);
+                            }
+                        }else if (subcommand === "ORPHANS"){
+                            jsonResponse(await reconcile.findOrphans());
                         }else if (["CANCEL", "REMOVE"].indexOf(subcommand) !== -1 && args.length >= 1){
                             const [ taskId ] = args;
                             const route = await routetable.lookup(taskId);

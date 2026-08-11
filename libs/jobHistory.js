@@ -29,7 +29,7 @@ const {sanitizeProjectName} = require('./gcsProjectName');
 // each event shows who worked on a job.
 
 const DEFAULT_HISTORY_FILE = path.join('data', 'jobs.json');
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const MAX_EVENTS_PER_JOB = 200;
 const MAX_EVENTS_PER_PROJECT = 50;
 
@@ -41,6 +41,24 @@ const STATUS = {
     CANCELED: 'canceled',
     DELETED: 'deleted'
 };
+
+// Where a commit is in the hand-off to a worker. Persisted because the gateway
+// can restart mid-dispatch, and an in-memory-only guard would then let a client
+// retry start a second worker VM for the same upload.
+const DISPATCH_PHASE = {
+    ACCEPTED: 'accepted',
+    QUEUED: 'queued',
+    DISPATCHING: 'dispatching',
+    ROUTED: 'routed'
+};
+
+// A phase in this set means "a dispatch owns this upload right now", which both
+// blocks a duplicate commit and protects tmp/<uuid> from cleanup.
+const ACTIVE_DISPATCH_PHASES = [
+    DISPATCH_PHASE.ACCEPTED,
+    DISPATCH_PHASE.QUEUED,
+    DISPATCH_PHASE.DISPATCHING
+];
 
 // Ordering used by applyStatus to decide which transitions are allowed.
 const STATUS_RANK = {
@@ -108,6 +126,11 @@ function newRecord(uuid, ownerKey, now){
         deletedAt: null,
         createdBy: null,
         lastUpdatedBy: null,
+        dispatchPhase: null,
+        dispatchAcceptedAt: null,
+        // Last worker we handed this job to (host/port/token). Survives a
+        // mid-dispatch crash so boot recovery can probe before releasing the claim.
+        worker: null,
         events: []
     };
 }
@@ -179,6 +202,23 @@ function applyStatus(record, status, options = {}){
     return true;
 }
 
+function isActivePhase(phase){
+    return ACTIVE_DISPATCH_PHASES.indexOf(phase) !== -1;
+}
+
+function isTerminal(status){
+    return TERMINAL.indexOf(status) !== -1;
+}
+
+// Whether a job's upload may still be committed again. A failed row qualifies:
+// that is what a swept orphan or a rejected commit looks like, and its files are
+// the only way back. Succeeded/canceled/deleted are final. Cleanup and the
+// pending-uploads list must agree here, or one deletes what the other offers.
+function isResumable(job){
+    if (!job) return false;
+    return !isTerminal(job.status) || job.status === STATUS.FAILED;
+}
+
 function toPublic(record){
     return {
         uuid: record.uuid,
@@ -220,6 +260,183 @@ function projectToPublic(record){
 
 module.exports = {
     STATUS,
+    DISPATCH_PHASE,
+
+    /**
+     * Claims the right to dispatch `uuid`, so a retried commit is a no-op that
+     * returns the original task instead of launching a second worker.
+     *
+     * The read-modify-write below runs without an await, which is what makes it
+     * atomic against concurrent requests on Node's single thread. Durability is
+     * therefore the caller's job: await `saved` before answering the client or
+     * touching a worker, or a restart in that window reloads a ledger with no
+     * claim and dispatches the same upload twice.
+     *
+     * @return {object} {accepted, reason, revived, job, saved}
+     */
+    tryAcceptCommit: function(uuid, options = {}){
+        const nothingWritten = Promise.resolve();
+        if (!uuid || !jobs) return {accepted: true, reason: null, revived: false, job: null, saved: nothingWritten};
+
+        const now = options.at || new Date().getTime();
+        const job = jobs[uuid];
+
+        if (job){
+            if (isActivePhase(job.dispatchPhase)){
+                return {accepted: false, reason: 'in-progress', revived: false, job, saved: nothingWritten};
+            }
+            if (job.dispatchPhase === DISPATCH_PHASE.ROUTED){
+                return {accepted: false, reason: 'routed', revived: false, job, saved: nothingWritten};
+            }
+            if (job.status === STATUS.DELETED || job.status === STATUS.CANCELED){
+                return {accepted: false, reason: job.status, revived: false, job, saved: nothingWritten};
+            }
+            if (job.status === STATUS.SUCCEEDED){
+                return {accepted: false, reason: 'succeeded', revived: false, job, saved: nothingWritten};
+            }
+        }
+
+        // A job the orphan sweeper already failed is still resumable as long as
+        // its uploaded files survived, so accept and let the caller revive it.
+        const revived = !!job && job.status === STATUS.FAILED;
+
+        const target = job || newRecord(uuid, options.ownerKey, now);
+        if (!job) jobs[uuid] = target;
+
+        target.dispatchPhase = DISPATCH_PHASE.ACCEPTED;
+        target.dispatchAcceptedAt = now;
+        target.updatedAt = now;
+
+        return {accepted: true, reason: null, revived, job: target, saved: scheduleSave()};
+    },
+
+    setDispatchPhase: async function(uuid, phase){
+        if (!uuid || !jobs) return null;
+        const job = jobs[uuid];
+        if (!job) return null;
+
+        job.dispatchPhase = phase || null;
+        if (!phase){
+            job.dispatchAcceptedAt = null;
+            // A released claim means this attempt is over; a retry must not
+            // inherit a half-assigned worker from the failed attempt.
+            if (job.worker && job.worker.token) job.worker = null;
+        }
+        job.updatedAt = new Date().getTime();
+        await scheduleSave();
+        return job;
+    },
+
+    clearDispatchPhase: async function(uuid){
+        return this.setDispatchPhase(uuid, null);
+    },
+
+    /**
+     * Remembers which worker is being (or was) handed this task, including its
+     * NodeODM token. Without the token, a post-restart probe of an autospawned
+     * worker looks like "unreachable" and the sweeper can orphan a live job.
+     *
+     * Resolves once the hint is on disk, so callers must await it before the
+     * outbound commit: a crash in between leaves a claim with no worker to probe.
+     */
+    setDispatchNode: async function(uuid, node){
+        if (!uuid || !jobs || !node) return null;
+        const job = jobs[uuid];
+        if (!job) return null;
+
+        job.worker = {
+            hostname: node.hostname(),
+            port: node.port(),
+            token: node.getToken() || ""
+        };
+        job.updatedAt = new Date().getTime();
+        await scheduleSave();
+        return job;
+    },
+
+    /**
+     * Drops dispatch claims left behind by a gateway that died mid-hand-off.
+     * Without this, a persisted `accepted` phase would reject every retry and
+     * every resume attempt forever, turning the idempotency guard into a trap.
+     *
+     * Prefer recoverDispatchClaims() in reconcile.js when a worker may already
+     * own the task; this helper is the blunt fallback that only clears.
+     *
+     * @param isLive {function} async (uuid) => bool, true while a dispatch is
+     *                          genuinely still running for that task.
+     */
+    clearStaleDispatchPhases: async function(isLive){
+        if (!jobs) return [];
+
+        const cleared = [];
+        for (const uuid of Object.keys(jobs)){
+            const job = jobs[uuid];
+            if (!isActivePhase(job.dispatchPhase)) continue;
+            if (await isLive(uuid)) continue;
+
+            job.dispatchPhase = null;
+            job.dispatchAcceptedAt = null;
+            job.worker = null;
+            cleared.push(uuid);
+        }
+
+        if (cleared.length) await scheduleSave();
+        return cleared;
+    },
+
+    /**
+     * True while tmp/<uuid> must survive cleanup because a dispatch is actively
+     * reading those files. Kept here so cleanup does not have to know the
+     * dispatch-phase vocabulary.
+     */
+    hasActiveDispatch: async function(uuid){
+        const job = await this.lookup(uuid);
+        return !!job && isActivePhase(job.dispatchPhase);
+    },
+
+    isTerminal: function(status){
+        return isTerminal(status);
+    },
+
+    isResumable: function(job){
+        return isResumable(job);
+    },
+
+    /**
+     * Raw records that have not reached an outcome yet. Used by the orphan
+     * sweeper, which needs dispatchPhase and events that toPublic() hides.
+     */
+    listNonTerminal: async function(){
+        if (!jobs) return [];
+        return Object.keys(jobs)
+            .map(uuid => jobs[uuid])
+            .filter(job => !isTerminal(job.status));
+    },
+
+    /**
+     * Last known worker for a job. Prefers the persisted worker record (which
+     * carries the auth token) and falls back to the `routed` event's host:port.
+     */
+    lastNodeHint: function(job){
+        if (!job) return null;
+
+        if (job.worker && job.worker.hostname){
+            return {
+                hostname: job.worker.hostname,
+                port: parseInt(job.worker.port, 10),
+                token: job.worker.token || ""
+            };
+        }
+
+        if (!Array.isArray(job.events)) return null;
+        for (let i = job.events.length - 1; i >= 0; i--){
+            const event = job.events[i];
+            if (event.action !== 'routed' || !event.detail) continue;
+            const match = String(event.detail).match(/^([^\s:]+):(\d+)$/);
+            if (match) return {hostname: match[1], port: parseInt(match[2], 10), token: ""};
+        }
+        return null;
+    },
 
     /**
      * Last known state in the shape NodeODM clients expect, so a task whose
@@ -227,13 +444,22 @@ module.exports = {
      */
     toTaskInfo: function(record){
         const settled = TERMINAL.indexOf(record.status) !== -1;
+        const status = {code: record.statusCode || statusCodes.FAILED};
+
+        // Clients render errorMessage; without it a failure reads as a bare
+        // "Failed" with no reason once the worker is gone.
+        if (status.code === statusCodes.FAILED && record.status === STATUS.FAILED){
+            const last = record.events && record.events[record.events.length - 1];
+            if (last && last.detail) status.errorMessage = last.detail;
+        }
+
         return {
             uuid: record.uuid,
             name: record.name || record.uuid,
             dateCreated: record.createdAt,
             processingTime: (record.startedAt && record.finishedAt) ?
                                 record.finishedAt - record.startedAt : -1,
-            status: {code: record.statusCode || statusCodes.FAILED},
+            status,
             options: [],
             imagesCount: record.imagesCount || 0,
             progress: settled ? 100 : 0
@@ -288,6 +514,16 @@ module.exports = {
                 const derived = codeFromStatus(job.status);
                 if (derived !== null) job.statusCode = derived;
             }
+
+            // Reaching an outcome ends the hand-off, so no claim is left to
+            // block a future commit for this uuid.
+            if (isTerminal(job.status)){
+                job.dispatchPhase = null;
+                job.dispatchAcceptedAt = null;
+                // Drop the worker token once the job is settled; host/port are
+                // still recoverable from the routed event if needed.
+                if (job.worker) job.worker.token = "";
+            }
         }
 
         job.events.push({
@@ -303,9 +539,35 @@ module.exports = {
         job.updatedAt = now;
         if (actor) job.lastUpdatedBy = Object.assign({}, actor, {action});
 
-        scheduleSave();
+        // Resolves only once the event is on disk. Callers act on lifecycle
+        // transitions (dispatching, routing, settling) right after this returns,
+        // so a fire-and-forget write would let a restart lose the transition and
+        // replay work the gateway already started.
+        await scheduleSave();
 
         return job;
+    },
+
+    /**
+     * Records an outcome the worker reported, whether it arrived by webhook or
+     * by the reconciler probing for it. The action mirrors the outcome so the
+     * activity feed does not label a crash as "finished", and the worker's own
+     * error message becomes the detail the UI shows.
+     */
+    recordWorkerOutcome: async function(uuid, taskInfo, options = {}){
+        const status = (taskInfo && taskInfo.status) || {};
+        const action = status.code === statusCodes.FAILED ? 'failed' :
+                       status.code === statusCodes.CANCELED ? 'canceled' : 'finished';
+
+        return this.record(uuid, action, Object.assign({
+            statusCode: status.code,
+            name: taskInfo && taskInfo.name,
+            imagesCount: taskInfo && taskInfo.imagesCount,
+            detail: status.errorMessage || null,
+            // The worker is authoritative, so this overrides an optimistic
+            // cancel recorded while it was still running.
+            force: true
+        }, options));
     },
 
     lookup: async function(uuid){
@@ -401,7 +663,10 @@ module.exports = {
             const content = JSON.parse(raw);
             if (content && content.jobs && typeof content.jobs === 'object'){
                 Object.keys(content.jobs).forEach(uuid => {
-                    if (!Array.isArray(content.jobs[uuid].events)) content.jobs[uuid].events = [];
+                    const job = content.jobs[uuid];
+                    if (!Array.isArray(job.events)) job.events = [];
+                    if (job.dispatchPhase === undefined) job.dispatchPhase = null;
+                    if (job.dispatchAcceptedAt === undefined) job.dispatchAcceptedAt = null;
                 });
                 const hasProjects = content.projects && typeof content.projects === 'object';
                 const loadedProjects = hasProjects ? content.projects : {};

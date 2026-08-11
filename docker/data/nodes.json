@@ -1,1 +1,1 @@
-[{"hostname":"host.docker.internal","port":4000,"token":"local-reference-node-token","locked":true}]
+[{"hostname":"host.docker.internal","port":4000,"token":"local-reference-node-token","locked":true},{"hostname":"host.docker.internal","port":"4000","token":"local-reference-node-token"}]
