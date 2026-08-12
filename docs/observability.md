@@ -1,8 +1,12 @@
 # Observability
 
 The gateway ships structured events to Cloud Logging so a stuck upload can be
-diagnosed without SSH. Every event lands in `jsonPayload` with an `event` field,
-so you filter on fields rather than grepping text.
+diagnosed without SSH. You filter on fields rather than grepping text.
+
+Field paths matter: logging-winston nests winston metadata one level down, so an
+event's fields live under `jsonPayload.metadata` — `jsonPayload.metadata.event`,
+`jsonPayload.metadata.taskId`, and so on. `jsonPayload.message` is the
+human-readable summary line for the same event.
 
 ## Prerequisites
 
@@ -58,8 +62,8 @@ the HTTP response finishing, so on a fast static dispatch it can land after
 | `task.failed` | Task failed; `detail` carries the reason |
 | `client.error` | A browser reported a failure via `POST /diag/client` |
 
-Common fields: `taskId`, `actor` (email), `imagesCount`, `node`, `detail`,
-`durationMs`, `outcome`.
+Common fields (all under `jsonPayload.metadata`): `taskId`, `actor` (email),
+`imagesCount`, `node`, `detail`, `durationMs`, `outcome`.
 
 ## Queries
 
@@ -76,9 +80,9 @@ The first thing to run when someone reports a stuck job.
 ```bash
 gcloud logging read \
   "logName=\"projects/$P/logs/clusterodm\"
-   AND jsonPayload.taskId=\"<uuid>\"" \
+   AND jsonPayload.metadata.taskId=\"<uuid>\"" \
   --project="$P" --freshness=7d --order=asc \
-  --format='table(timestamp, jsonPayload.event, jsonPayload.outcome, jsonPayload.detail)'
+  --format='table(timestamp, jsonPayload.metadata.event, jsonPayload.metadata.outcome, jsonPayload.metadata.detail)'
 ```
 
 Read it against the healthy sequence above. Where it stops tells you the phase:
@@ -102,7 +106,7 @@ Read it against the healthy sequence above. Where it stops tells you the phase:
 ```bash
 gcloud logging read \
   "logName=\"projects/$P/logs/clusterodm\"
-   AND jsonPayload.event=~\"task\..*failed|task\.orphaned|client\.error\"" \
+   AND jsonPayload.metadata.event=~\"task\..*failed|task\.orphaned|client\.error\"" \
   --project="$P" --freshness=1h --format=json
 ```
 
@@ -111,10 +115,10 @@ gcloud logging read \
 ```bash
 gcloud logging read \
   "logName=\"projects/$P/logs/clusterodm\"
-   AND jsonPayload.event=\"task.commit.responded\"
-   AND jsonPayload.outcome=\"aborted\"" \
+   AND jsonPayload.metadata.event=\"task.commit.responded\"
+   AND jsonPayload.metadata.outcome=\"aborted\"" \
   --project="$P" --freshness=7d \
-  --format='table(timestamp, jsonPayload.taskId, jsonPayload.actor, jsonPayload.durationMs)'
+  --format='table(timestamp, jsonPayload.metadata.taskId, jsonPayload.metadata.actor, jsonPayload.metadata.durationMs)'
 ```
 
 A nonzero count here is expected and benign now — each one should be followed by
@@ -126,23 +130,24 @@ events means the client-side retry is not working.
 ```bash
 gcloud logging read \
   "logName=\"projects/$P/logs/clusterodm\"
-   AND jsonPayload.event=\"client.error\"" \
+   AND jsonPayload.metadata.event=\"client.error\"" \
   --project="$P" --freshness=24h \
-  --format='table(timestamp, jsonPayload.actor, jsonPayload.phase, jsonPayload.status, jsonPayload.connection, jsonPayload.message)'
+  --format='table(timestamp, jsonPayload.metadata.actor, jsonPayload.metadata.phase, jsonPayload.metadata.status, jsonPayload.metadata.connection, jsonPayload.metadata.clientMessage)'
 ```
 
 `phase` says where in the flow the browser was, `status=0` means the request
 never reached the server, and `connection` carries the Network Information API
-hint when the browser exposes it.
+hint when the browser exposes it. The browser's own error text is
+`clientMessage`, not `message`, because winston reserves the latter.
 
 ### One user's recent activity
 
 ```bash
 gcloud logging read \
   "logName=\"projects/$P/logs/clusterodm\"
-   AND jsonPayload.actor=\"someone@aspadeco.com\"" \
+   AND jsonPayload.metadata.actor=\"someone@aspadeco.com\"" \
   --project="$P" --freshness=24h \
-  --format='table(timestamp, jsonPayload.event, jsonPayload.taskId)'
+  --format='table(timestamp, jsonPayload.metadata.event, jsonPayload.metadata.taskId)'
 ```
 
 ### Caddy access logs

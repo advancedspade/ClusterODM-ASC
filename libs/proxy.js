@@ -1055,7 +1055,10 @@ module.exports = {
                     logger.event('client.error', {
                         taskId: utils.isTaskUuid(report.taskId) ? report.taskId : null,
                         actor: actor && actor.email,
-                        message: clipField(report.message, 500),
+                        // Not `message`: winston folds a metadata field by that
+                        // name into its summary line, so it never becomes a
+                        // queryable field on the log entry.
+                        clientMessage: clipField(report.message, 500),
                         endpoint: clipField(report.endpoint, 300),
                         phase: clipField(report.phase, 60),
                         status: numberField(report.status),
