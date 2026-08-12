@@ -77,9 +77,16 @@ if (process.env.GOOGLE_CLOUD_PROJECT){
 }
 
 /**
- * Structured lifecycle event. `name` lands in jsonPayload.event and the rest of
- * `fields` becomes sibling jsonPayload keys, so an incident can be reconstructed
- * from a single taskId filter instead of substring-matching free text.
+ * Structured lifecycle event, so an incident can be reconstructed from a single
+ * taskId filter instead of substring-matching free text.
+ *
+ * logging-winston nests all winston metadata one level down, so `name` lands in
+ * `jsonPayload.metadata.event` and each field in `jsonPayload.metadata.<field>`.
+ * Query and alert on those paths, not `jsonPayload.<field>`.
+ *
+ * Avoid the keys winston consumes itself — `message`, `stack`, `splat` — as field
+ * names: winston folds them into the summary line and they never reach
+ * `metadata`. (`level` is the exception, read below to pick the severity.)
  */
 logger.event = function(name, fields = {}){
     const payload = Object.assign({}, fields, {event: name});
