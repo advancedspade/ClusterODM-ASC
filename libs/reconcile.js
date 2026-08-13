@@ -151,8 +151,16 @@ async function reapMachine(job, detail){
     if (!name) return false;
 
     const asr = asrProvider.get();
+    // No ASR (or a destroy that threw) means we could not free the VM. Keep the
+    // breadcrumb: clearing it here is how the only durable name of a leaked
+    // instance disappears before a later boot or a manual cleanup can use it.
     if (!asr){
-        await jobHistory.clearDispatchMachine(job.uuid);
+        logger.event('task.machine.reap.failed', {
+            taskId: job.uuid,
+            machine: name,
+            detail: 'autoscaler unavailable',
+            level: 'warn'
+        });
         return false;
     }
 
@@ -167,8 +175,6 @@ async function reapMachine(job, detail){
         logger.event('task.machine.reaped', {taskId: job.uuid, machine: name, detail});
         return true;
     }catch(e){
-        // Keep the breadcrumb so the next pass retries. Dropping it here is how
-        // a VM ends up running with nothing left that knows its name.
         logger.event('task.machine.reap.failed', {
             taskId: job.uuid,
             machine: name,

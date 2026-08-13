@@ -863,6 +863,21 @@ async function testDispatchClaimRecovery(){
                            "a claim held past --orphan-timeout must be released");
         assert.deepStrictEqual(destroyed, ["clusterodm-orphan", "clusterodm-held"],
                                "a claim released after its hold must free its machine too");
+
+        // Without ASR there is no destroy API. Forgetting the name would make
+        // the leak permanent; keep it so a later boot (or a human) can still act.
+        const noAsr = "78787878-7878-4787-8787-787878787878";
+        await jobHistory.record(noAsr, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
+        jobHistory.tryAcceptCommit(noAsr, {ownerKey: "owner-a"});
+        await jobHistory.setDispatchPhase(noAsr, jobHistory.DISPATCH_PHASE.DISPATCHING);
+        await jobHistory.setDispatchMachine(noAsr, "clusterodm-no-asr");
+        asrProvider.get = () => null;
+        const withoutAsr = await reconcile.recoverDispatchClaims();
+        assert.ok(withoutAsr.cleared >= 1);
+        assert.strictEqual((await jobHistory.lookup(noAsr)).dispatchPhase, null);
+        assert.strictEqual((await jobHistory.lookup(noAsr)).machine.name, "clusterodm-no-asr",
+                           "an unavailable autoscaler must not erase the machine breadcrumb");
+        assert.deepStrictEqual(destroyed, ["clusterodm-orphan", "clusterodm-held"]);
     }finally{
         asrProvider.get = originalAsrGet;
         await new Promise(resolve => worker.close(resolve));
