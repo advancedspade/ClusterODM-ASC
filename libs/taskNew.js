@@ -660,11 +660,38 @@ module.exports = {
 
         if (autoscale){
             const asr = asrProvider.get();
+
+            // createNode tears the machine down on its own failure paths, but it
+            // swallows a failed teardown. Confirm the VM is gone before dropping
+            // the only record of its name, and leave the breadcrumb behind if we
+            // cannot: a logged name is recoverable, a forgotten one is not.
+            const discardMachine = async () => {
+                if (!dmHostname) return;
+                try{
+                    await asr.destroyMachine(dmHostname);
+                    await jobHistory.clearDispatchMachine(uuid);
+                }catch(e){
+                    logger.event('task.machine.reap.failed', {
+                        taskId: uuid,
+                        machine: dmHostname,
+                        detail: e.message,
+                        level: 'warn'
+                    });
+                }
+            };
+
             try{
                 dmHostname = asr.generateHostname(imagesCount);
+                // createNode can spend minutes waiting for the VM to boot, and
+                // until it returns nothing durable knows the VM exists. Name it
+                // first so reconcile can reap it if we die in that window.
+                await jobHistory.setDispatchMachine(uuid, dmHostname);
                 node = await asr.createNode(req, imagesCount, token, dmHostname, status);
                 if (!status.aborted) nodes.add(node);
-                else return;
+                else{
+                    await discardMachine();
+                    return;
+                }
                 // Persist before doUpload: if we die after the worker accepts
                 // the commit, boot recovery must still find host/port/token.
                 await jobHistory.setDispatchNode(uuid, node);
@@ -676,6 +703,7 @@ module.exports = {
                     autoscale: true
                 });
             }catch(e){
+                await discardMachine();
                 const err = new Error("No nodes available (attempted to autoscale but failed). Try again later.");
                 logger.warn(`Cannot create node via autoscaling: ${e.message}`);
                 handleError(err);
@@ -690,6 +718,10 @@ module.exports = {
             eventEmitter.emit('close');
 
             await routetable.add(uuid, node, token);
+            // The route and nodes.json now own this VM's teardown, so the
+            // breadcrumb's job is done. It only ever means "a machine exists
+            // that nothing else tracks".
+            await jobHistory.clearDispatchMachine(uuid);
             await tasktable.delete(uuid);
             await jobHistory.setDispatchNode(uuid, node);
             await jobHistory.record(uuid, 'routed', {

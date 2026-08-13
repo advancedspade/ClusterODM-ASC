@@ -131,6 +131,10 @@ function newRecord(uuid, ownerKey, now){
         // Last worker we handed this job to (host/port/token). Survives a
         // mid-dispatch crash so boot recovery can probe before releasing the claim.
         worker: null,
+        // Autoscaled machine name, written before the VM is asked for. Nothing
+        // else knows the VM exists until it comes online and joins nodes.json,
+        // so without this a crash mid-creation leaks it forever.
+        machine: null,
         events: []
     };
 }
@@ -349,6 +353,39 @@ module.exports = {
             port: node.port(),
             token: node.getToken() || ""
         };
+        job.updatedAt = new Date().getTime();
+        await scheduleSave();
+        return job;
+    },
+
+    /**
+     * Names the autoscaled machine this job is about to ask for. Must be awaited
+     * before the VM is created: between the create call and the worker joining
+     * nodes.json, this record is the only thing that knows the VM exists, and a
+     * gateway that dies in that window otherwise leaves it running forever.
+     */
+    setDispatchMachine: async function(uuid, name){
+        if (!uuid || !jobs || !name) return null;
+        const job = jobs[uuid];
+        if (!job) return null;
+
+        job.machine = {name: String(name), createdAt: new Date().getTime()};
+        job.updatedAt = new Date().getTime();
+        await scheduleSave();
+        return job;
+    },
+
+    /**
+     * Forgets the machine, which means "nobody needs to reap this any more" —
+     * either it was destroyed or it never existed. Survives a settled status on
+     * purpose: a breadcrumb we failed to act on is the record of a leaked VM.
+     */
+    clearDispatchMachine: async function(uuid){
+        if (!uuid || !jobs) return null;
+        const job = jobs[uuid];
+        if (!job || !job.machine) return job || null;
+
+        job.machine = null;
         job.updatedAt = new Date().getTime();
         await scheduleSave();
         return job;
@@ -667,6 +704,7 @@ module.exports = {
                     if (!Array.isArray(job.events)) job.events = [];
                     if (job.dispatchPhase === undefined) job.dispatchPhase = null;
                     if (job.dispatchAcceptedAt === undefined) job.dispatchAcceptedAt = null;
+                    if (job.machine === undefined) job.machine = null;
                 });
                 const hasProjects = content.projects && typeof content.projects === 'object';
                 const loadedProjects = hasProjects ? content.projects : {};

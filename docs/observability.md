@@ -57,6 +57,8 @@ the HTTP response finishing, so on a fast static dispatch it can land after
 | `task.queued` | No capacity; waiting for a node |
 | `task.dispatch.retained` | Persisted worker unreachable; claim held and re-probed rather than released |
 | `task.dispatch.reset` | Dispatch recovery cleared a phase left behind by a restart |
+| `task.machine.reaped` | Destroyed the autoscaled VM a released or orphaned job was holding |
+| `task.machine.reap.failed` | That VM could not be destroyed; `machine` names what to check by hand |
 | `task.recovered` | Orphan sweep found the task alive on a worker and healed the ledger |
 | `task.orphaned` | Orphan sweep gave up and marked the task failed |
 | `task.failed` | Task failed; `detail` carries the reason |
@@ -100,6 +102,12 @@ Read it against the healthy sequence above. Where it stops tells you the phase:
   that release is what emits `task.dispatch.reset`. An unreachable worker emits
   `task.dispatch.retained` instead and is asked again next pass, because
   releasing on a timeout is how a resume starts a duplicate run.
+- stops between `task.dispatch.start` and `task.dispatch.node` — the gateway died
+  while an autoscaled VM was booting, the window in which nothing but the ledger
+  knows that VM exists. Releasing the claim also destroys it (`task.machine.reaped`),
+  since the resume always asks for a fresh worker and the abandoned one would
+  otherwise sit there consuming the CPU quota. A `task.machine.reap.failed` means
+  the VM is still up and needs deleting by hand.
 
 ### Everything the alert fires on
 
