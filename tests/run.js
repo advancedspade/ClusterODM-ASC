@@ -763,6 +763,7 @@ async function testDispatchClaimRecovery(){
     const reconcile = require("../libs/reconcile");
     const routetable = require("../libs/routetable");
     const tasktable = require("../libs/tasktable");
+    const asrProvider = require("../libs/asrProvider");
     const statusCodes = require("../libs/statusCodes");
 
     const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "clusterodm-recover-"));
@@ -780,6 +781,10 @@ async function testDispatchClaimRecovery(){
         }
     });
 
+    const destroyed = [];
+    const originalAsrGet = asrProvider.get;
+    asrProvider.get = () => ({destroyMachine: async name => { destroyed.push(name); }});
+
     try{
         await new Promise(resolve => worker.listen(0, "127.0.0.1", resolve));
         const workerPort = worker.address().port;
@@ -791,6 +796,7 @@ async function testDispatchClaimRecovery(){
         await jobHistory.record(uuid, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
         jobHistory.tryAcceptCommit(uuid, {ownerKey: "owner-a"});
         await jobHistory.setDispatchPhase(uuid, jobHistory.DISPATCH_PHASE.DISPATCHING);
+        await jobHistory.setDispatchMachine(uuid, "clusterodm-live");
         await jobHistory.setDispatchNode(uuid, new Node("127.0.0.1", workerPort, "worker-token"));
 
         const hint = jobHistory.lastNodeHint(await jobHistory.lookup(uuid));
@@ -802,17 +808,26 @@ async function testDispatchClaimRecovery(){
         assert.strictEqual((await jobHistory.lookup(uuid)).dispatchPhase, jobHistory.DISPATCH_PHASE.ROUTED);
         assert.strictEqual((await jobHistory.lookup(uuid)).status, jobHistory.STATUS.RUNNING);
         assert.ok(await routetable.lookup(uuid), "boot recovery must restore a route for status reads");
+        assert.deepStrictEqual(destroyed, [],
+                               "a worker that still has the task must keep its machine");
 
-        // No worker on the claim → release so a resume can proceed.
+        // No worker on the claim → release so a resume can proceed. This is the
+        // shape of a gateway killed inside createNode: the VM was named but never
+        // registered, so nothing but the breadcrumb can free its quota.
         const stranded = "34343434-3434-4343-8343-343434343434";
         await jobHistory.record(stranded, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
         jobHistory.tryAcceptCommit(stranded, {ownerKey: "owner-a"});
         await jobHistory.setDispatchPhase(stranded, jobHistory.DISPATCH_PHASE.DISPATCHING);
+        await jobHistory.setDispatchMachine(stranded, "clusterodm-orphan");
         const released = await reconcile.recoverDispatchClaims();
         assert.ok(released.cleared >= 1);
         assert.strictEqual((await jobHistory.lookup(stranded)).dispatchPhase, null);
         assert.strictEqual(jobHistory.tryAcceptCommit(stranded).accepted, true,
                            "a claim with no recoverable worker must be resumable");
+        assert.deepStrictEqual(destroyed, ["clusterodm-orphan"],
+                               "releasing a claim must destroy the machine it was holding");
+        assert.strictEqual((await jobHistory.lookup(stranded)).machine, null,
+                           "a reaped machine must not be reaped again next pass");
 
         // An unreachable worker proves nothing. Releasing the claim on a startup
         // timeout is exactly how a resume starts a second run of a task the worker
@@ -826,10 +841,13 @@ async function testDispatchClaimRecovery(){
         await jobHistory.record(unreachable, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
         jobHistory.tryAcceptCommit(unreachable, {ownerKey: "owner-a"});
         await jobHistory.setDispatchPhase(unreachable, jobHistory.DISPATCH_PHASE.DISPATCHING);
+        await jobHistory.setDispatchMachine(unreachable, "clusterodm-held");
         await jobHistory.setDispatchNode(unreachable, new Node("127.0.0.1", deadPort, "worker-token"));
 
         const held = await reconcile.recoverDispatchClaims();
         assert.strictEqual(held.retained, 1, `expected the claim to be held, got ${JSON.stringify(held)}`);
+        assert.deepStrictEqual(destroyed, ["clusterodm-orphan"],
+                               "a held claim's worker may still be running: do not destroy its machine");
         assert.strictEqual((await jobHistory.lookup(unreachable)).dispatchPhase,
                            jobHistory.DISPATCH_PHASE.DISPATCHING,
                            "an inconclusive probe must not release a persisted worker claim");
@@ -843,7 +861,25 @@ async function testDispatchClaimRecovery(){
         assert.strictEqual(expired.retained, 0);
         assert.strictEqual((await jobHistory.lookup(unreachable)).dispatchPhase, null,
                            "a claim held past --orphan-timeout must be released");
+        assert.deepStrictEqual(destroyed, ["clusterodm-orphan", "clusterodm-held"],
+                               "a claim released after its hold must free its machine too");
+
+        // Without ASR there is no destroy API. Forgetting the name would make
+        // the leak permanent; keep it so a later boot (or a human) can still act.
+        const noAsr = "78787878-7878-4787-8787-787878787878";
+        await jobHistory.record(noAsr, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
+        jobHistory.tryAcceptCommit(noAsr, {ownerKey: "owner-a"});
+        await jobHistory.setDispatchPhase(noAsr, jobHistory.DISPATCH_PHASE.DISPATCHING);
+        await jobHistory.setDispatchMachine(noAsr, "clusterodm-no-asr");
+        asrProvider.get = () => null;
+        const withoutAsr = await reconcile.recoverDispatchClaims();
+        assert.ok(withoutAsr.cleared >= 1);
+        assert.strictEqual((await jobHistory.lookup(noAsr)).dispatchPhase, null);
+        assert.strictEqual((await jobHistory.lookup(noAsr)).machine.name, "clusterodm-no-asr",
+                           "an unavailable autoscaler must not erase the machine breadcrumb");
+        assert.deepStrictEqual(destroyed, ["clusterodm-orphan", "clusterodm-held"]);
     }finally{
+        asrProvider.get = originalAsrGet;
         await new Promise(resolve => worker.close(resolve));
         process.chdir(originalCwd);
     }

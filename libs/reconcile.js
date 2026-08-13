@@ -36,6 +36,8 @@ const jobHistory = require('./jobHistory');
 const routetable = require('./routetable');
 const tasktable = require('./tasktable');
 const nodes = require('./nodes');
+const netutils = require('./netutils');
+const asrProvider = require('./asrProvider');
 const statusCodes = require('./statusCodes');
 const Node = require('./classes/Node');
 
@@ -138,6 +140,52 @@ async function applyReachableProbe(job, probe, route){
 }
 
 /**
+ * Destroys the autoscaled VM a job was holding, once that job is releasing its
+ * claim or being settled. The ledger names the machine before it is created, so
+ * this covers the window nodes.json knows nothing about: a gateway that dies
+ * while waiting for a worker to boot leaves a VM that nothing else can find,
+ * and it runs until it exhausts the CPU quota for every later job.
+ */
+async function reapMachine(job, detail){
+    const name = job.machine && job.machine.name;
+    if (!name) return false;
+
+    const asr = asrProvider.get();
+    // No ASR (or a destroy that threw) means we could not free the VM. Keep the
+    // breadcrumb: clearing it here is how the only durable name of a leaked
+    // instance disappears before a later boot or a manual cleanup can use it.
+    if (!asr){
+        logger.event('task.machine.reap.failed', {
+            taskId: job.uuid,
+            machine: name,
+            detail: 'autoscaler unavailable',
+            level: 'warn'
+        });
+        return false;
+    }
+
+    try{
+        // Go through netutils when the worker did manage to register, so
+        // nodes.json and the route table stop pointing at a deleted VM.
+        const registered = nodes.find(n => n.getDockerMachineName() === name);
+        if (registered) await netutils.removeAndCleanupNode(registered, asr);
+        else await asr.destroyMachine(name);
+
+        await jobHistory.clearDispatchMachine(job.uuid);
+        logger.event('task.machine.reaped', {taskId: job.uuid, machine: name, detail});
+        return true;
+    }catch(e){
+        logger.event('task.machine.reap.failed', {
+            taskId: job.uuid,
+            machine: name,
+            detail: e.message,
+            level: 'warn'
+        });
+        return false;
+    }
+}
+
+/**
  * Before releasing a mid-dispatch claim, ask the persisted worker whether it
  * already accepted the task. Clearing blindly would let a resume launch a second
  * worker while the first run continues.
@@ -190,6 +238,7 @@ async function recoverDispatchClaims(){
                     detail: `worker ${probe.node} no longer has this task`
                 });
                 await jobHistory.clearDispatchPhase(job.uuid);
+                await reapMachine(job, `worker ${probe.node} no longer has this task`);
                 cleared++;
                 continue;
             }
@@ -216,6 +265,11 @@ async function recoverDispatchClaims(){
         }
 
         await jobHistory.clearDispatchPhase(job.uuid);
+        // A released claim means no dispatch owns this upload any more, so any
+        // machine it was still holding has to go: the resume that follows always
+        // asks for a fresh VM (the old worker's token died with the process),
+        // and it will hit the CPU quota if the abandoned one is still running.
+        await reapMachine(job, 'dispatch claim released');
         cleared++;
     }
 
@@ -292,6 +346,7 @@ async function sweep(){
                                    : 'orphaned - gateway lost track of this task'
         });
         await jobHistory.clearDispatchPhase(job.uuid);
+        await reapMachine(job, 'job orphaned');
 
         orphaned++;
         logger.event('task.orphaned', {
