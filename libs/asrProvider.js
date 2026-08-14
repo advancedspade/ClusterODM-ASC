@@ -79,12 +79,25 @@ module.exports = {
         if (asrProvider){
             const node = await routetable.lookupNode(taskId);
             if (node && node.isAutoSpawned()){
-                // Attempt to retrieve task info and save it in task table before deleting node
-                // so that users can continue to access this information.
+                // Snapshot everything the worker can still answer for. Once the
+                // VM is gone this table is the only place a client can read the
+                // task's final info and console output from.
                 try{
                     const route = await routetable.lookup(taskId);
                     if (route){
-                        await tasktable.add(taskId, {taskInfo: await node.taskInfo(taskId)}, route.token);
+                        const taskInfo = await node.taskInfo(taskId);
+                        // An unusable snapshot is worse than none: it would be
+                        // served in preference to the ledger for two days. Let
+                        // the ledger answer instead.
+                        if (taskInfo && !taskInfo.error && taskInfo.status){
+                            const output = await node.taskOutput(taskId);
+                            await tasktable.add(taskId, {
+                                taskInfo,
+                                output: Array.isArray(output) ? output : []
+                            }, route.token);
+                        }else{
+                            logger.warn(`Cannot add task table entry for ${taskId} from ${node}: ${(taskInfo && taskInfo.error) || 'no status reported'}`);
+                        }
                     }else{
                         logger.warn(`Cannot add task table entry for ${taskId} (route missing)`);
                     }

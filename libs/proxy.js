@@ -483,6 +483,66 @@ module.exports = {
             return Number.isFinite(num) ? num : null;
         };
 
+        const READONLY_TASK_ACTIONS = ['info', 'output'];
+
+        /**
+         * Answers /task/<uuid>/info and /task/<uuid>/output from the gateway's own
+         * state: the task table snapshot taken before a worker is torn down, then
+         * the durable job ledger. Returns false when the gateway knows nothing
+         * about the task and the caller has to produce an error.
+         */
+        const serveTaskFromLocalState = async (res, taskId, action, query = {}) => {
+            const taskTableEntry = await tasktable.lookup(taskId);
+            // An entry with no snapshot cannot answer /info; the ledger can.
+            if (taskTableEntry && (action !== 'info' || taskTableEntry.taskInfo)){
+                if (action === 'info'){
+                    let response = taskTableEntry.taskInfo;
+
+                    // ?with_output support
+                    if (query.with_output !== undefined){
+                        const line = parseInt(query.with_output) || 0;
+                        const output = taskTableEntry.output || [];
+                        response.output = output.slice(line, output.length);
+                    }
+
+                    // Populate processingTime if needed
+                    if (response.processingTime === undefined){
+                        response = utils.clone(response);
+                        if (response.dateCreated && response.status && response.status.code === statusCodes.RUNNING){
+                            response.processingTime = (new Date().getTime()) - response.dateCreated;
+                        }else{
+                            response.processingTime = -1;
+                        }
+                    }
+
+                    json(res, response);
+                }else if (action === 'output'){
+                    const line = query.line || 0;
+                    const output = taskTableEntry.output || [];
+                    json(res, output.slice(line, output.length));
+                }else{
+                    json(res, { error: `Invalid route for taskId ${taskId}:${action}, no valid route possible.`});
+                }
+                return true;
+            }
+
+            const job = await jobHistory.lookup(taskId);
+            if (job){
+                if (action === 'info'){
+                    const taskInfo = jobHistory.toTaskInfo(job);
+                    if (query.with_output !== undefined) taskInfo.output = [];
+                    json(res, taskInfo);
+                }else if (action === 'output'){
+                    json(res, []);
+                }else{
+                    json(res, { error: `Invalid route for taskId ${taskId}:${action}, no valid route possible.`});
+                }
+                return true;
+            }
+
+            return false;
+        };
+
         const proxy = new HttpProxy();
         const optionsCache = new ValueCache({expires: 60 * 60 * 1000});
         const pathHandlers = {
@@ -522,16 +582,41 @@ module.exports = {
         }
 
         // Listen for the `error` event on `proxy`.
-        proxy.on('error', function (err, req, res) {
-            // If the error is caused by a connection issue,
-            // we actually simulate the same behavior by dropping the connection
-            // because returning an error could make a NodeODM client assume that something failed
-            if (res.socket && (err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED')){
-                logger.warn(`Proxy redirect error: ${err.message}`);
-                res.socket.destroy();
-            }else{
-                json(res, {error: `Proxy redirect error: ${err.message}`});
+        proxy.on('error', async function (err, req, res) {
+            const ctx = req.proxyTaskContext || {};
+
+            // A worker that died mid-flight is a transport failure, not a task
+            // outcome. Keep it out of the task.* namespace so it stays queryable
+            // without reading as a processing failure.
+            logger.event('proxy.redirect.failed', {
+                taskId: ctx.taskId || null,
+                action: ctx.action || null,
+                node: ctx.node ? String(ctx.node) : null,
+                errorCode: err.code || 'UNKNOWN',
+                detail: err.message,
+                level: 'warn'
+            });
+
+            // Reads can still be answered from what the gateway knows, which is
+            // the whole point of the task table snapshot and the job ledger.
+            if (ctx.taskId && READONLY_TASK_ACTIONS.indexOf(ctx.action) !== -1 && !res.headersSent){
+                try{
+                    if (await serveTaskFromLocalState(res, ctx.taskId, ctx.action, ctx.query)) return;
+                }catch(e){
+                    logger.warn(`Cannot serve ${ctx.taskId}:${ctx.action} from local state: ${e.message}`);
+                }
             }
+
+            if (res.headersSent){
+                if (res.socket) res.socket.destroy();
+                return;
+            }
+
+            // Nothing local to fall back on: drop the connection rather than hand
+            // back a JSON body, which a NodeODM client reads as the task itself
+            // having failed.
+            if (res.socket) res.socket.destroy();
+            else json(res, {error: `Proxy redirect error: ${err.message}`});
         });
 
         // Added for CORS support
@@ -1189,65 +1274,37 @@ module.exports = {
                             }
                         }
 
-                        const node = await routetable.lookupNode(taskId);
+                        let node = await routetable.lookupNode(taskId);
 
-                        if (node){
+                        // A route can outlive its node when a worker is reaped or
+                        // deregistered. Proxying to the old IP hangs until TCP
+                        // timeout and surfaces to the client as a task error.
+                        if (node && !nodes.find(n => n.hostname() === node.hostname() && n.port() === node.port())){
+                            logger.event('task.route.stale', {
+                                taskId,
+                                action,
+                                node: String(node)
+                            });
+                            await routetable.delete(taskId);
+                            node = null;
+                        }
+
+                        // A task table entry alongside a live route means the worker
+                        // already committed its outcome and is being torn down, so
+                        // the snapshot — not the VM — is the source of truth.
+                        const snapshot = node && READONLY_TASK_ACTIONS.indexOf(action) !== -1 ?
+                                            await tasktable.lookup(taskId) :
+                                            null;
+                        const preferLocal = !!snapshot && (action !== 'info' || !!snapshot.taskInfo);
+
+                        if (node && !preferLocal){
+                            // Read by the proxy error handler, which has no other way
+                            // to know which task a failed socket belonged to.
+                            req.proxyTaskContext = { taskId, action, node, query };
                             overrideRequest(req, node, query, pathname);
                             proxy.web(req, res, { target: node.proxyTargetUrl() });
-                        }else{
-                            const taskTableEntry = await tasktable.lookup(taskId);
-                            if (taskTableEntry){
-
-                                // GET: /task/<uuid>/info
-                                if (action === 'info'){
-                                    let response = taskTableEntry.taskInfo;
-
-                                    // ?with_output support
-                                    if (query.with_output !== undefined){
-                                        const line = parseInt(query.with_output) || 0;
-                                        const output = taskTableEntry.output || [];
-                                        response.output = output.slice(line, output.length);
-                                    }
-
-                                    // Populate processingTime if needed
-                                    if (response.processingTime === undefined){
-                                        response = utils.clone(response);
-                                        if (response.dateCreated && response.status && response.status.code === statusCodes.RUNNING){
-                                            response.processingTime = (new Date().getTime()) - response.dateCreated;
-                                        }else{
-                                            response.processingTime = -1;
-                                        }
-                                    }
-
-                                    json(res, response);
-
-                                // GET: /task/<uuid>/output
-                                }else if (action === 'output'){
-                                    const line = query.line || 0;
-                                    const output = taskTableEntry.output || [];
-                                    json(res, output.slice(line, output.length));
-                                }else{
-                                    json(res, { error: `Invalid route for taskId ${taskId}:${action}, no valid route possible.`});
-                                }
-                            }else{
-                                // Nothing live and nothing cached: serve the durable
-                                // outcome so a refresh shows the result rather than
-                                // a routing error.
-                                const job = await jobHistory.lookup(taskId);
-                                if (job){
-                                    if (action === 'info'){
-                                        const taskInfo = jobHistory.toTaskInfo(job);
-                                        if (query.with_output !== undefined) taskInfo.output = [];
-                                        json(res, taskInfo);
-                                    }else if (action === 'output'){
-                                        json(res, []);
-                                    }else{
-                                        json(res, { error: `Invalid route for taskId ${taskId}:${action}, no valid route possible.`});
-                                    }
-                                }else{
-                                    json(res, { error: `Invalid route for taskId ${taskId}:${action}, no task table entry.`});
-                                }
-                            }
+                        }else if (!await serveTaskFromLocalState(res, taskId, action, query)){
+                            json(res, { error: `Invalid route for taskId ${taskId}:${action}, no task table entry.`});
                         }
                     }else{
                         json(res, { error: `Cannot handle ${pathname}`});

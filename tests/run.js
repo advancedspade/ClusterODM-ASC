@@ -522,6 +522,162 @@ async function testRemoveWithoutRoute(){
     }
 }
 
+// An autoscaled worker is deleted the moment its task commits, but polls keep
+// coming. Proxying those to the reaped VM hangs until TCP timeout and reaches
+// the browser as "Proxy redirect error", indistinguishable from a failed job.
+async function testInfoSurvivesWorkerTeardown(){
+    const nodesLib = require("../libs/nodes");
+    const routetable = require("../libs/routetable");
+    const tasktable = require("../libs/tasktable");
+    const jobHistory = require("../libs/jobHistory");
+    const netutils = require("../libs/netutils");
+    const LocalCloudProvider = require("../libs/cloud-providers/LocalCloudProvider");
+
+    let proxy = null;
+    try{
+        proxy = require("../libs/proxy");
+    }catch(e){
+        if (String(e.message).indexOf("node_libcurl.node") === -1) throw e;
+        console.log("SKIP testInfoSurvivesWorkerTeardown: node-libcurl binding unavailable on this architecture");
+        return;
+    }
+
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "clusterodm-teardown-"));
+    fs.mkdirSync(path.join(workDir, "data"));
+    fs.mkdirSync(path.join(workDir, "tmp"));
+
+    const originalCwd = process.cwd();
+    const originalToken = config.token;
+    config.token = "";
+    process.chdir(workDir);
+
+    const routedTask = "44444444-4444-4444-8444-444444444444";
+    const staleTask = "55555555-5555-4555-8555-555555555555";
+
+    let workerHits = 0;
+    const worker = http.createServer((req, res) => {
+        workerHits++;
+        res.writeHead(200, {"Content-Type": "application/json"});
+        res.end(JSON.stringify({uuid: routedTask, name: "Autoscaled job", status: {code: 20}, progress: 42}));
+    });
+
+    let server = null;
+    let workerClosed = false;
+    try{
+        await new Promise(resolve => worker.listen(0, "127.0.0.1", resolve));
+        const workerPort = worker.address().port;
+
+        const servers = await proxy.initialize(new LocalCloudProvider());
+        server = servers[0].server;
+        await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+        const port = server.address().port;
+
+        const get = (urlPath) => {
+            return new Promise((resolve, reject) => {
+                const req = http.request({host: "127.0.0.1", port, path: urlPath, method: "GET"}, res => {
+                    let data = "";
+                    res.on("data", c => { data += c; });
+                    res.on("end", () => {
+                        try{
+                            resolve(JSON.parse(data));
+                        }catch(e){
+                            reject(new Error(`Bad JSON from ${urlPath}: ${data}`));
+                        }
+                    });
+                });
+                req.on("error", reject);
+                req.end();
+            });
+        };
+
+        const node = new Node("127.0.0.1", workerPort, "worker-token");
+        node.setDockerMachine("clusterodm-test-vm", 0, 0);
+        nodesLib.add(node);
+        await routetable.add(routedTask, node, "owner-a");
+        await jobHistory.record(routedTask, "created", {
+            ownerKey: "owner-a",
+            name: "Autoscaled job",
+            imagesCount: 12,
+            status: jobHistory.STATUS.QUEUED
+        });
+
+        const live = await get(`/task/${routedTask}/info?token=owner-a`);
+        assert.strictEqual(live.status.code, 20, `expected the live worker to answer, got ${JSON.stringify(live)}`);
+        assert.strictEqual(workerHits, 1);
+
+        // The worker commits: the gateway snapshots what it will need and the
+        // autoscaler tears the VM down.
+        await tasktable.add(routedTask, {
+            taskInfo: {
+                uuid: routedTask,
+                name: "Autoscaled job",
+                status: {code: 40},
+                progress: 100,
+                imagesCount: 12,
+                processingTime: 154000
+            },
+            output: ["Running ODM...", "Done!"]
+        }, "owner-a");
+        await jobHistory.record(routedTask, "finished", {statusCode: 40, force: true});
+
+        const destroyed = [];
+        const atDestroy = {};
+        await netutils.removeAndCleanupNode(node, {
+            destroyNode: async n => {
+                atDestroy.route = await routetable.lookupNode(routedTask);
+                atDestroy.registered = nodesLib.find(x => x === n) || null;
+                destroyed.push(String(n));
+            }
+        });
+        assert.deepStrictEqual(destroyed, [String(node)]);
+        // A cloud delete takes seconds to minutes. Anything still routed here
+        // once it starts spends that window hanging on a dying VM.
+        assert.strictEqual(atDestroy.route, null, "the route must be gone before the VM delete starts");
+        assert.strictEqual(atDestroy.registered, null, "the node must be deregistered before the VM delete starts");
+
+        // The VM is gone: anything still routed here would hang on a dead IP.
+        await new Promise(resolve => worker.close(resolve));
+        workerClosed = true;
+
+        const hitsBeforePoll = workerHits;
+        for (let i = 0; i < 3; i++){
+            const after = await get(`/task/${routedTask}/info?token=owner-a`);
+            assert.strictEqual(after.error, undefined,
+                               `a reaped worker must not read as a task error, got ${JSON.stringify(after)}`);
+            assert.strictEqual(after.status.code, 40, `expected the completed status, got ${JSON.stringify(after)}`);
+            assert.strictEqual(after.processingTime, 154000);
+        }
+        assert.strictEqual(workerHits, hitsBeforePoll, "no poll may reach the reaped node");
+
+        const output = await get(`/task/${routedTask}/output?token=owner-a`);
+        assert.deepStrictEqual(output, ["Running ODM...", "Done!"],
+                               "console output must survive the worker it came from");
+
+        // routes.json can outlive nodes.json across a restart mid-reap. The
+        // route is dead weight and must be dropped, not proxied.
+        const deadPort = await new Promise(resolve => {
+            const probe = http.createServer();
+            probe.listen(0, "127.0.0.1", () => {
+                const p = probe.address().port;
+                probe.close(() => resolve(p));
+            });
+        });
+        await jobHistory.record(staleTask, "created", {ownerKey: "owner-a", name: "Stale route job"});
+        await jobHistory.record(staleTask, "finished", {statusCode: 40, force: true});
+        await routetable.add(staleTask, new Node("127.0.0.1", deadPort, "worker-token"), "owner-a");
+
+        const stale = await get(`/task/${staleTask}/info?token=owner-a`);
+        assert.strictEqual(stale.status.code, 40, `expected the durable outcome, got ${JSON.stringify(stale)}`);
+        assert.strictEqual(await routetable.lookup(staleTask), null,
+                           "a route whose node is no longer registered must be dropped, not proxied");
+    }finally{
+        if (server) await new Promise(resolve => server.close(resolve));
+        if (!workerClosed) await new Promise(resolve => worker.close(resolve));
+        process.chdir(originalCwd);
+        config.token = originalToken;
+    }
+}
+
 // The enabling fix for the lost-commit incident: a client that never saw the
 // response must be able to POST the same commit again without starting a second
 // run, and a gateway that died mid-dispatch must not leave the uuid locked.
@@ -979,6 +1135,7 @@ async function testReferenceNodeTokenRotation(){
     await testDispatchClaimRecovery();
     await testLedgerAwareCleanup();
     await testRemoveWithoutRoute();
+    await testInfoSurvivesWorkerTeardown();
     console.log("All tests passed");
 
     // The proxy's housekeeping intervals keep the event loop alive.
