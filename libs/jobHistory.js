@@ -292,7 +292,11 @@ module.exports = {
             if (job.dispatchPhase === DISPATCH_PHASE.ROUTED){
                 return {accepted: false, reason: 'routed', revived: false, job, saved: nothingWritten};
             }
-            if (job.status === STATUS.DELETED || job.status === STATUS.CANCELED){
+            if (job.status === STATUS.DELETED){
+                return {accepted: false, reason: job.status, revived: false, job, saved: nothingWritten};
+            }
+            // An explicit restart may revive a canceled job; a plain commit may not.
+            if (job.status === STATUS.CANCELED && !options.allowRestart){
                 return {accepted: false, reason: job.status, revived: false, job, saved: nothingWritten};
             }
             if (job.status === STATUS.SUCCEEDED){
@@ -302,7 +306,9 @@ module.exports = {
 
         // A job the orphan sweeper already failed is still resumable as long as
         // its uploaded files survived, so accept and let the caller revive it.
-        const revived = !!job && job.status === STATUS.FAILED;
+        // An explicit restart can also revive a canceled job whose upload is intact.
+        const revived = !!job && (job.status === STATUS.FAILED ||
+            (options.allowRestart && job.status === STATUS.CANCELED));
 
         const target = job || newRecord(uuid, options.ownerKey, now);
         if (!job) jobs[uuid] = target;

@@ -311,7 +311,7 @@ module.exports = {
          * the response can POST the same commit again and gets the original uuid
          * back rather than starting a second run.
          */
-        const commitTask = async ({ req, res, taskId, userToken, actor, limits }) => {
+        const commitTask = async ({ req, res, taskId, userToken, actor, limits, restart = false }) => {
             const tmpPath = path.join('tmp', taskId);
             const bodyFile = path.join(tmpPath, 'body.json');
             const actorEmail = actor && actor.email;
@@ -361,8 +361,13 @@ module.exports = {
                 duplicate('routed');
                 return;
             }
-            if (existing && (existing.status === jobHistory.STATUS.DELETED ||
-                             existing.status === jobHistory.STATUS.CANCELED)){
+            if (existing && existing.status === jobHistory.STATUS.DELETED){
+                logger.event('task.commit.rejected', {taskId, actor: actorEmail, detail: existing.status});
+                json(res, {error: `Task ${taskId} was ${existing.status} and cannot be committed again.`});
+                return;
+            }
+            // A plain commit cannot revive a canceled job; an explicit restart can.
+            if (existing && existing.status === jobHistory.STATUS.CANCELED && !restart){
                 logger.event('task.commit.rejected', {taskId, actor: actorEmail, detail: existing.status});
                 json(res, {error: `Task ${taskId} was ${existing.status} and cannot be committed again.`});
                 return;
@@ -403,7 +408,10 @@ module.exports = {
             body.fileNames = files;
             body.imagesCount = files.length;
 
-            const claim = jobHistory.tryAcceptCommit(taskId, {ownerKey: userToken});
+            const claim = jobHistory.tryAcceptCommit(taskId, {
+                ownerKey: userToken,
+                allowRestart: restart
+            });
             if (!claim.accepted){
                 if (claim.reason === jobHistory.STATUS.DELETED || claim.reason === jobHistory.STATUS.CANCELED){
                     logger.event('task.commit.rejected', {taskId, actor: actorEmail, detail: claim.reason});
@@ -427,8 +435,8 @@ module.exports = {
                 actor,
                 name: body.taskName,
                 imagesCount: body.imagesCount,
-                // Resuming a swept orphan has to move it off `failed` explicitly,
-                // since the ledger otherwise refuses to walk a settled job back.
+                // Resuming a swept orphan or an explicit cancel-restart has to
+                // move the row off its settled status explicitly.
                 status: claim.revived ? jobHistory.STATUS.QUEUED : undefined,
                 allowRevive: claim.revived
             });
@@ -438,7 +446,8 @@ module.exports = {
                 actor: actorEmail,
                 imagesCount: body.imagesCount,
                 name: body.taskName,
-                resumed: claim.revived
+                resumed: claim.revived,
+                restart: !!restart
             });
 
             try{
@@ -1049,8 +1058,64 @@ module.exports = {
                             }
                         };
 
+                        // GCS-backed deployments can re-run from outputs/<project>/images/
+                        // when the gateway no longer holds the upload or a worker.
+                        const gcsReprocessAvailable = () => {
+                            const provider = asrProvider.get();
+                            const gcsConfig = provider && provider.getConfig && provider.getConfig("gcs");
+                            return !!(gcsConfig && gcsConfig.bucket &&
+                                      provider.getDriverName && provider.getDriverName() === "gce");
+                        };
+
+                        const refuseRestart = async () => {
+                            const job = await jobHistory.lookup(taskId);
+                            const base = `Cannot restart task ${taskId}: its processing node is no longer available. Please create a new task.`;
+                            if (job && gcsReprocessAvailable()){
+                                const project = sanitizeProjectName(job.name || "", taskId);
+                                if (project){
+                                    json(res, {
+                                        error: base,
+                                        reprocess: { project, name: job.name || project }
+                                    });
+                                    return;
+                                }
+                            }
+                            json(res, { error: base });
+                        };
+
+                        // Re-dispatch from a gateway-held upload (canceled before
+                        // the worker received the files, or cancel that left tmp/).
+                        // Returns true when it answered the response.
+                        const restartFromLocalUpload = async () => {
+                            const bodyFile = path.join('tmp', taskId, 'body.json');
+                            if (!fs.existsSync(bodyFile)) return false;
+
+                            if (await jobHistory.hasActiveDispatch(taskId)){
+                                json(res, {
+                                    error: `Cannot restart task ${taskId}: it is still shutting down. Please try again in a moment.`
+                                });
+                                return true;
+                            }
+
+                            await tasktable.delete(taskId);
+                            await recordAction();
+                            await commitTask({
+                                req, res, taskId, userToken, actor, limits,
+                                restart: true
+                            });
+                            return true;
+                        };
+
                         let node = await routetable.lookupNode(taskId);
                         if (node){
+                            if (pathname === '/task/restart'){
+                                // A delayed teardown from /commit would otherwise
+                                // delete this worker out from under the revived job.
+                                asrProvider.cancelCleanup(taskId);
+                                // Drop any pre-teardown snapshot so /info keeps
+                                // reading the live worker instead of "Canceled".
+                                await tasktable.delete(taskId);
+                            }
                             await recordAction();
                             overrideRequest(req, node, query, pathname);
                             proxy.web(req, res, { 
@@ -1066,10 +1131,11 @@ module.exports = {
                                         taskTableEntry.abort = null;
                                         logger.info(`Task ${taskId} aborted via ${pathname}`);
                                     }
-                                    
-                                    utils.rmdir(path.join('tmp', taskId));
 
+                                    // Keep tmp/ on cancel so Restart can re-dispatch
+                                    // without re-uploading. Remove still deletes it.
                                     if (pathname === '/task/remove'){
+                                        utils.rmdir(path.join('tmp', taskId));
                                         await tasktable.delete(taskId);
                                     }
 
@@ -1080,6 +1146,9 @@ module.exports = {
 
                                     await recordAction();
                                     json(res, { success: true });
+                                }else if (pathname === '/task/restart'){
+                                    if (await restartFromLocalUpload()) return;
+                                    await refuseRestart();
                                 }else{
                                     json(res, { error: `Action not supported. Please create a new task.` });
                                 }
@@ -1089,9 +1158,12 @@ module.exports = {
                                 // canceling are idempotent for any signed-in teammate.
                                 const job = await jobHistory.lookup(taskId);
                                 if (pathname === '/task/restart'){
-                                    json(res, { error: `Cannot restart task ${taskId}: its processing node is no longer available. Please create a new task.`});
+                                    if (await restartFromLocalUpload()) return;
+                                    await refuseRestart();
                                 }else{
-                                    utils.rmdir(path.join('tmp', taskId));
+                                    if (pathname === '/task/remove'){
+                                        utils.rmdir(path.join('tmp', taskId));
+                                    }
 
                                     // Jobs predating the history ledger have no row to
                                     // update, but the client still needs to drop them.
