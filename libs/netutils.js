@@ -53,19 +53,41 @@ module.exports = {
         });
     },
 
+    // Deregistration happens before the VM is destroyed: a cloud delete takes
+    // seconds to minutes, and anything still routed to the node in that window
+    // hangs until TCP timeout and reaches the client as a task error.
     removeAndCleanupNode: async function(node, asr = null){
+        let result = false;
+
         try{
-            if (node.isAutoSpawned() && asr) await asr.destroyNode(node);
             await routetable.removeByNode(node);
-            const result = nodes.remove(node);
-            // A worker just freed an autoscaling slot; let any locally queued
-            // tasks (see taskNew.js) know it's worth checking for capacity.
-            if (node.isAutoSpawned()) capacityEvents.emit('changed');
-            return result;
+            result = nodes.remove(node);
         }catch(e){
             logger.warn(`Remove and cleanup failed: ${e.message}`);
             logger.debug(e);
             return false;
         }
+
+        if (node.isAutoSpawned()){
+            if (asr){
+                try{
+                    await asr.destroyNode(node);
+                }catch(e){
+                    // The node is already unreachable from the gateway, so this
+                    // only leaks a VM. Name it so the bill is traceable.
+                    logger.event('node.destroy.failed', {
+                        node: String(node),
+                        machine: node.getDockerMachineName(),
+                        detail: e.message
+                    });
+                }
+            }
+
+            // A worker just freed an autoscaling slot; let any locally queued
+            // tasks (see taskNew.js) know it's worth checking for capacity.
+            capacityEvents.emit('changed');
+        }
+
+        return result;
     }
 };

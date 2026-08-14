@@ -62,10 +62,19 @@ the HTTP response finishing, so on a fast static dispatch it can land after
 | `task.recovered` | Orphan sweep found the task alive on a worker and healed the ledger |
 | `task.orphaned` | Orphan sweep gave up and marked the task failed |
 | `task.failed` | Task failed; `detail` carries the reason |
+| `task.route.stale` | A route outlived its node; dropped before it could be proxied |
+| `proxy.redirect.failed` | A proxied request to a worker died in transport; `errorCode` says how |
+| `node.destroy.failed` | An autoscaled VM survived its delete; `machine` names what to check by hand |
 | `client.error` | A browser reported a failure via `POST /diag/client` |
 
 Common fields (all under `jsonPayload.metadata`): `taskId`, `actor` (email),
 `imagesCount`, `node`, `detail`, `durationMs`, `outcome`.
+
+`proxy.redirect.failed` is deliberately outside the `task.*` namespace and is not
+part of the alerting metric below. It says the gateway could not reach a worker,
+not that processing failed — reads fall back to the task table snapshot and the
+job ledger, so a client normally never sees it. Sustained volume for one `node`
+means a worker is unreachable while still registered.
 
 ## Queries
 
@@ -147,6 +156,21 @@ gcloud logging read \
 never reached the server, and `connection` carries the Network Information API
 hint when the browser exposes it. The browser's own error text is
 `clientMessage`, not `message`, because winston reserves the latter.
+
+### Workers that stopped answering
+
+```bash
+gcloud logging read \
+  "logName=\"projects/$P/logs/clusterodm\"
+   AND jsonPayload.metadata.event=\"proxy.redirect.failed\"" \
+  --project="$P" --freshness=24h \
+  --format='table(timestamp, jsonPayload.metadata.taskId, jsonPayload.metadata.node, jsonPayload.metadata.errorCode, jsonPayload.metadata.action)'
+```
+
+`ETIMEDOUT` against an autoscaled worker points at a VM that was deleted while
+still routed — pair it with `task.route.stale` for the same `node`. `ECONNREFUSED`
+during the first minute of a task's life is the worker still booting and is
+expected.
 
 ### One user's recent activity
 
