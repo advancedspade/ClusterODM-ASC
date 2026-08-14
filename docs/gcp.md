@@ -90,6 +90,12 @@ status, actors, and events.
 - Removing or canceling a job whose worker is gone succeeds instead of failing
   with a routing error, and `GET /task/<uuid>/info` falls back to the ledger's
   last known outcome for any signed-in teammate.
+- Restarting a canceled job re-dispatches it when the gateway still holds the
+  upload under `tmp/<uuid>/` (cancel no longer deletes that directory). When the
+  worker is already gone and there is no local upload, the gateway returns a
+  `reprocess` hint so the UI can load `outputs/<project>/images/` from GCS and
+  start a new run. A delayed autoscaler teardown scheduled by `/commit` is
+  canceled if Restart lands while the worker is still reachable.
 - Reprocess sends `reprocessProject=true` through the gateway to the worker,
   allows reusing an existing folder name, and clears stale outputs (everything
   except `images/` and `gcp/`) only after the new run succeeds, right before

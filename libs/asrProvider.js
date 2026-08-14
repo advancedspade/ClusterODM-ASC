@@ -28,6 +28,10 @@ const config = require('../config');
 // new VMs in the cloud to handle workloads when we run out of existing nodes
 let asrProvider = null;
 
+// taskId -> timeout handle for a delayed worker teardown. A restart inside the
+// cleanup window must cancel this, or the VM disappears under a revived job.
+const pendingCleanups = {};
+
 module.exports = {
     initialize: async function(userConfig){
         if (!userConfig) return;
@@ -117,18 +121,33 @@ module.exports = {
     },
 
     cleanup: async function(taskId, delay = 0){
-        if (asrProvider){
+        if (this.get()){
             const node = await routetable.lookupNode(taskId);
             if (node && node.isAutoSpawned()){
+                // A second schedule for the same task replaces the first; the
+                // older timer would otherwise tear the node down on its own clock.
+                this.cancelCleanup(taskId);
+
                 const run = () => {
+                    delete pendingCleanups[taskId];
                     netutils.removeAndCleanupNode(node, this.get());
                 };
 
                 logger.debug(`ASR cleanup (in ${delay / 1000} seconds)`);
-                if (delay) setTimeout(run, delay);
+                if (delay) pendingCleanups[taskId] = setTimeout(run, delay);
                 else run();
             }
         }
+    },
+
+    // Returns true when a pending delayed teardown was canceled.
+    cancelCleanup: function(taskId){
+        const timer = pendingCleanups[taskId];
+        if (!timer) return false;
+        clearTimeout(timer);
+        delete pendingCleanups[taskId];
+        logger.debug(`ASR cleanup canceled for ${taskId}`);
+        return true;
     },
 
     vacuum: async function(){

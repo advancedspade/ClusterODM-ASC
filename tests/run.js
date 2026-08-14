@@ -511,10 +511,14 @@ async function testRemoveWithoutRoute(){
         const withoutDeleted = await request("GET", "/task/history?token=owner-a&include_deleted=0");
         assert.deepStrictEqual(withoutDeleted.body.jobs, []);
 
-        // Restart cannot be honored without a node, and says so.
+        // Restart cannot be honored without a node or a local upload, and says so.
+        // A deleted job has no upload to revive; the UI falls back to cloud re-process
+        // only when the GCS ASR is configured.
         const restart = await request("POST", "/task/restart?token=owner-a", removeBody(finishedTask));
         assert.ok(restart.body.error && restart.body.error.indexOf("no longer available") !== -1,
                   `expected restart guidance, got ${JSON.stringify(restart.body)}`);
+        assert.strictEqual(restart.body.reprocess, undefined,
+                           "without a GCS ASR the response must not offer a dead reprocess hint");
     }finally{
         if (server) await new Promise(resolve => server.close(resolve));
         process.chdir(originalCwd);
@@ -738,11 +742,21 @@ async function testCommitIdempotency(){
     assert.strictEqual(revive.accepted, true);
     assert.strictEqual(revive.revived, true, "a swept upload must be resumable");
 
-    // Deleting or canceling is final; committing again must not resurrect it.
+    // Deleting is final; committing again must not resurrect it. Canceling is
+    // final for a plain commit, but an explicit restart may revive it.
     const dropped = "66666666-6666-4666-8666-666666666666";
     await jobHistory.record(dropped, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
     await jobHistory.record(dropped, "deleted", {status: jobHistory.STATUS.DELETED});
     assert.strictEqual(jobHistory.tryAcceptCommit(dropped).reason, jobHistory.STATUS.DELETED);
+
+    const canceled = "77777777-7777-4777-8777-777777777777";
+    await jobHistory.record(canceled, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
+    await jobHistory.record(canceled, "canceled", {status: jobHistory.STATUS.CANCELED});
+    assert.strictEqual(jobHistory.tryAcceptCommit(canceled).reason, jobHistory.STATUS.CANCELED,
+                       "a plain commit must not revive a canceled job");
+    const restartClaim = jobHistory.tryAcceptCommit(canceled, {ownerKey: "owner-a", allowRestart: true});
+    assert.strictEqual(restartClaim.accepted, true, "an explicit restart may revive a canceled job");
+    assert.strictEqual(restartClaim.revived, true);
 }
 
 function statusCodesFor(name){
@@ -1121,6 +1135,177 @@ async function testReferenceNodeTokenRotation(){
     assert.strictEqual(node.isLocked(), true);
 }
 
+// Cancel used to wipe tmp/<uuid>, so Restart always hit "Action not supported".
+// A gateway-held upload must survive cancel and be re-dispatchable.
+async function testCancelThenRestartLocalUpload(){
+    const jobHistory = require("../libs/jobHistory");
+    const tasktable = require("../libs/tasktable");
+    const statusCodes = require("../libs/statusCodes");
+    const LocalCloudProvider = require("../libs/cloud-providers/LocalCloudProvider");
+
+    let proxy = null;
+    try{
+        proxy = require("../libs/proxy");
+    }catch(e){
+        if (String(e.message).indexOf("node_libcurl.node") === -1) throw e;
+        console.log("SKIP testCancelThenRestartLocalUpload: node-libcurl binding unavailable on this architecture");
+        return;
+    }
+
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "clusterodm-restart-"));
+    fs.mkdirSync(path.join(workDir, "data"));
+    fs.mkdirSync(path.join(workDir, "tmp"));
+
+    const originalCwd = process.cwd();
+    const originalToken = config.token;
+    config.token = "";
+    process.chdir(workDir);
+
+    const taskId = "88888888-8888-4888-8888-888888888888";
+    let server = null;
+    try{
+        const servers = await proxy.initialize(new LocalCloudProvider());
+        server = servers[0].server;
+        await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+        const port = server.address().port;
+
+        const request = (method, urlPath, body) => {
+            return new Promise((resolve, reject) => {
+                const payload = body === undefined ? null : Buffer.from(body);
+                const req = http.request({
+                    host: "127.0.0.1",
+                    port,
+                    path: urlPath,
+                    method,
+                    headers: payload ? {
+                        "Content-Type": "multipart/form-data; boundary=----t",
+                        "Content-Length": payload.length
+                    } : {}
+                }, res => {
+                    let data = "";
+                    res.on("data", c => { data += c; });
+                    res.on("end", () => {
+                        try{
+                            resolve({statusCode: res.statusCode, body: JSON.parse(data)});
+                        }catch(e){
+                            reject(new Error(`Bad JSON from ${urlPath}: ${data}`));
+                        }
+                    });
+                });
+                req.on("error", reject);
+                if (payload) req.write(payload);
+                req.end();
+            });
+        };
+
+        const formBody = (uuid) =>
+            `------t\r\nContent-Disposition: form-data; name="uuid"\r\n\r\n${uuid}\r\n------t--\r\n`;
+
+        const tmpPath = path.join("tmp", taskId);
+        fs.mkdirSync(tmpPath);
+        fs.writeFileSync(path.join(tmpPath, "body.json"), JSON.stringify({
+            taskName: "Restart me",
+            options: "[]",
+            imagesCount: 1
+        }));
+        fs.writeFileSync(path.join(tmpPath, "img001.jpg"), "fake-image");
+
+        await tasktable.add(taskId, {
+            taskInfo: {
+                uuid: taskId,
+                name: "Restart me",
+                status: {code: statusCodes.QUEUED},
+                imagesCount: 1
+            },
+            output: ["Queued: waiting for available processing capacity."]
+        }, "owner-a");
+        await jobHistory.record(taskId, "created", {
+            ownerKey: "owner-a",
+            name: "Restart me",
+            imagesCount: 1,
+            status: jobHistory.STATUS.QUEUED
+        });
+
+        const canceled = await request("POST", "/task/cancel?token=owner-a", formBody(taskId));
+        assert.strictEqual(canceled.body.success, true, `expected cancel success, got ${JSON.stringify(canceled.body)}`);
+        assert.ok(fs.existsSync(path.join(tmpPath, "body.json")),
+                  "cancel must keep the gateway-held upload so Restart can re-dispatch it");
+        assert.strictEqual((await jobHistory.lookup(taskId)).status, jobHistory.STATUS.CANCELED);
+        const snapshot = await tasktable.lookup(taskId);
+        assert.ok(snapshot && snapshot.taskInfo.status.code === statusCodes.CANCELED,
+                  "the task table snapshot must show canceled");
+
+        const restarted = await request("POST", "/task/restart?token=owner-a", formBody(taskId));
+        // No processing node is online in this fixture, so the re-dispatch itself
+        // fails — but it must get past "Action not supported" and clear the snapshot.
+        assert.ok(!restarted.body.error || restarted.body.error.indexOf("Action not supported") === -1,
+                  `restart must not hit the old dead-end, got ${JSON.stringify(restarted.body)}`);
+        assert.ok(restarted.body.uuid || restarted.body.error,
+                  `expected a uuid or a dispatch error, got ${JSON.stringify(restarted.body)}`);
+        assert.strictEqual(await tasktable.lookup(taskId), null,
+                           "restart must drop the canceled snapshot before re-dispatch");
+
+        const after = await jobHistory.lookup(taskId);
+        assert.ok(after.status !== jobHistory.STATUS.CANCELED,
+                  `restart must leave the ledger off canceled, got ${after.status}`);
+    }finally{
+        if (server) await new Promise(resolve => server.close(resolve));
+        process.chdir(originalCwd);
+        config.token = originalToken;
+    }
+}
+
+// A delayed ASR teardown must be cancelable, otherwise Restart during the
+// ~10s /commit window proxies to a worker that disappears moments later.
+async function testCancelCleanupPreservesWorker(){
+    const asrProvider = require("../libs/asrProvider");
+    const nodesLib = require("../libs/nodes");
+    const routetable = require("../libs/routetable");
+    const netutils = require("../libs/netutils");
+
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "clusterodm-cleanup-"));
+    fs.mkdirSync(path.join(workDir, "data"));
+    const originalCwd = process.cwd();
+    process.chdir(workDir);
+
+    const taskId = "99999999-9999-4999-8999-999999999999";
+    const originalGet = asrProvider.get;
+    const destroyed = [];
+
+    try{
+        await routetable.initialize();
+
+        const node = new Node("127.0.0.1", 3999, "worker-token");
+        node.setDockerMachine("clusterodm-cleanup-vm", 0, 0);
+        nodesLib.add(node);
+        await routetable.add(taskId, node, "owner-a");
+
+        asrProvider.get = () => ({
+            destroyNode: async (n) => { destroyed.push(String(n)); },
+            destroyMachine: async (name) => { destroyed.push(name); }
+        });
+
+        await asrProvider.cleanup(taskId, 200);
+        assert.strictEqual(asrProvider.cancelCleanup(taskId), true,
+                           "cancelCleanup must clear a pending delayed teardown");
+
+        await new Promise(resolve => setTimeout(resolve, 400));
+
+        assert.deepStrictEqual(destroyed, [], "a canceled teardown must not destroy the worker");
+        assert.ok(nodesLib.find(n => n === node), "the node must still be registered");
+        assert.ok(await routetable.lookupNode(taskId), "the route must still exist");
+
+        // A second cancel with nothing pending is a quiet no-op.
+        assert.strictEqual(asrProvider.cancelCleanup(taskId), false);
+
+        await netutils.removeAndCleanupNode(node, asrProvider.get());
+    }finally{
+        asrProvider.get = originalGet;
+        asrProvider.cancelCleanup(taskId);
+        process.chdir(originalCwd);
+    }
+}
+
 (async function(){
     await testRoutes();
     await testRouteTableDurability();
@@ -1136,6 +1321,8 @@ async function testReferenceNodeTokenRotation(){
     await testLedgerAwareCleanup();
     await testRemoveWithoutRoute();
     await testInfoSurvivesWorkerTeardown();
+    await testCancelThenRestartLocalUpload();
+    await testCancelCleanupPreservesWorker();
     console.log("All tests passed");
 
     // The proxy's housekeeping intervals keep the event loop alive.
