@@ -35,6 +35,7 @@ const logger = require('./logger');
 const accessLog = require('./accessLog');
 const statusCodes = require('./statusCodes');
 const taskNew = require('./taskNew');
+const dispatchRegistry = require('./dispatchRegistry');
 const async = require('async');
 const odmOptions = require('./odmOptions');
 const asrProvider = require('./asrProvider');
@@ -366,8 +367,8 @@ module.exports = {
                 json(res, {error: `Task ${taskId} was ${existing.status} and cannot be committed again.`});
                 return;
             }
-            // A plain commit cannot revive a canceled job; an explicit restart can.
-            if (existing && existing.status === jobHistory.STATUS.CANCELED && !restart){
+            // Canceled is final — including an explicit restart.
+            if (existing && existing.status === jobHistory.STATUS.CANCELED){
                 logger.event('task.commit.rejected', {taskId, actor: actorEmail, detail: existing.status});
                 json(res, {error: `Task ${taskId} was ${existing.status} and cannot be committed again.`});
                 return;
@@ -1083,22 +1084,30 @@ module.exports = {
                             json(res, { error: base });
                         };
 
-                        // Re-dispatch from a gateway-held upload (canceled before
-                        // the worker received the files, or cancel that left tmp/).
-                        // Returns true when it answered the response.
+                        // Re-dispatch from a gateway-held upload when the worker is
+                        // gone but tmp/ survived (e.g. a swept orphan). Cancel
+                        // deletes tmp/, so this does not revive canceled jobs.
                         const restartFromLocalUpload = async () => {
                             const bodyFile = path.join('tmp', taskId, 'body.json');
                             if (!fs.existsSync(bodyFile)) return false;
 
-                            if (await jobHistory.hasActiveDispatch(taskId)){
+                            const job = await jobHistory.lookup(taskId);
+                            if (job && job.status === jobHistory.STATUS.CANCELED){
+                                return false;
+                            }
+
+                            // A previous attempt may still be unwinding after an
+                            // abort. Ask the dispatcher directly, or this starts a
+                            // second one while the first still holds the files.
+                            if (dispatchRegistry.isDispatching(taskId) || await jobHistory.hasActiveDispatch(taskId)){
                                 json(res, {
-                                    error: `Cannot restart task ${taskId}: it is still shutting down. Please try again in a moment.`
+                                    error: `Cannot restart task ${taskId}: the previous attempt is still shutting down. Please try again in a moment.`
                                 });
                                 return true;
                             }
 
                             await tasktable.delete(taskId);
-                            await recordAction();
+                            await jobHistory.record(taskId, 'restarted', {ownerKey: userToken, actor});
                             await commitTask({
                                 req, res, taskId, userToken, actor, limits,
                                 restart: true
@@ -1109,11 +1118,18 @@ module.exports = {
                         let node = await routetable.lookupNode(taskId);
                         if (node){
                             if (pathname === '/task/restart'){
+                                const job = await jobHistory.lookup(taskId);
+                                // Cancel is final. Do not revive a canceled job on
+                                // a worker that still happens to be reachable.
+                                if (job && job.status === jobHistory.STATUS.CANCELED){
+                                    await refuseRestart();
+                                    return;
+                                }
                                 // A delayed teardown from /commit would otherwise
                                 // delete this worker out from under the revived job.
                                 asrProvider.cancelCleanup(taskId);
                                 // Drop any pre-teardown snapshot so /info keeps
-                                // reading the live worker instead of "Canceled".
+                                // reading the live worker instead of a stale status.
                                 await tasktable.delete(taskId);
                             }
                             await recordAction();
@@ -1132,10 +1148,16 @@ module.exports = {
                                         logger.info(`Task ${taskId} aborted via ${pathname}`);
                                     }
 
-                                    // Keep tmp/ on cancel so Restart can re-dispatch
-                                    // without re-uploading. Remove still deletes it.
+                                    // Cancel and remove both drop the upload. Cancel is
+                                    // final; Resume/Restart are not offered for it.
+                                    // Await so the response means the files are gone.
+                                    await new Promise(resolve => {
+                                        utils.rmfr(path.join('tmp', taskId), err => {
+                                            if (err) logger.warn(`Cannot delete tmp/${taskId}: ${err}`);
+                                            resolve();
+                                        });
+                                    });
                                     if (pathname === '/task/remove'){
-                                        utils.rmdir(path.join('tmp', taskId));
                                         await tasktable.delete(taskId);
                                     }
 
@@ -1161,9 +1183,14 @@ module.exports = {
                                     if (await restartFromLocalUpload()) return;
                                     await refuseRestart();
                                 }else{
-                                    if (pathname === '/task/remove'){
-                                        utils.rmdir(path.join('tmp', taskId));
-                                    }
+                                    // Same as remove: a leftover tmp/ would look
+                                    // resumable even though cancel settled the job.
+                                    await new Promise(resolve => {
+                                        utils.rmfr(path.join('tmp', taskId), err => {
+                                            if (err) logger.warn(`Cannot delete tmp/${taskId}: ${err}`);
+                                            resolve();
+                                        });
+                                    });
 
                                     // Jobs predating the history ledger have no row to
                                     // update, but the client still needs to drop them.

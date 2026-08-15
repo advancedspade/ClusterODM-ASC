@@ -742,8 +742,7 @@ async function testCommitIdempotency(){
     assert.strictEqual(revive.accepted, true);
     assert.strictEqual(revive.revived, true, "a swept upload must be resumable");
 
-    // Deleting is final; committing again must not resurrect it. Canceling is
-    // final for a plain commit, but an explicit restart may revive it.
+    // Deleting and canceling are final; committing again must not resurrect them.
     const dropped = "66666666-6666-4666-8666-666666666666";
     await jobHistory.record(dropped, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
     await jobHistory.record(dropped, "deleted", {status: jobHistory.STATUS.DELETED});
@@ -754,9 +753,9 @@ async function testCommitIdempotency(){
     await jobHistory.record(canceled, "canceled", {status: jobHistory.STATUS.CANCELED});
     assert.strictEqual(jobHistory.tryAcceptCommit(canceled).reason, jobHistory.STATUS.CANCELED,
                        "a plain commit must not revive a canceled job");
-    const restartClaim = jobHistory.tryAcceptCommit(canceled, {ownerKey: "owner-a", allowRestart: true});
-    assert.strictEqual(restartClaim.accepted, true, "an explicit restart may revive a canceled job");
-    assert.strictEqual(restartClaim.revived, true);
+    assert.strictEqual(jobHistory.tryAcceptCommit(canceled, {ownerKey: "owner-a", allowRestart: true}).reason,
+                       jobHistory.STATUS.CANCELED,
+                       "cancel is final even for an explicit restart");
 }
 
 function statusCodesFor(name){
@@ -1135,12 +1134,12 @@ async function testReferenceNodeTokenRotation(){
     assert.strictEqual(node.isLocked(), true);
 }
 
-// Cancel used to wipe tmp/<uuid>, so Restart always hit "Action not supported".
-// A gateway-held upload must survive cancel and be re-dispatchable.
-async function testCancelThenRestartLocalUpload(){
+// Cancel drops tmp/<uuid> and is final — Restart must not revive it.
+async function testCancelDropsUploadAndBlocksRestart(){
     const jobHistory = require("../libs/jobHistory");
     const tasktable = require("../libs/tasktable");
     const statusCodes = require("../libs/statusCodes");
+    const floodMonitor = require("../libs/floodMonitor");
     const LocalCloudProvider = require("../libs/cloud-providers/LocalCloudProvider");
 
     let proxy = null;
@@ -1148,11 +1147,11 @@ async function testCancelThenRestartLocalUpload(){
         proxy = require("../libs/proxy");
     }catch(e){
         if (String(e.message).indexOf("node_libcurl.node") === -1) throw e;
-        console.log("SKIP testCancelThenRestartLocalUpload: node-libcurl binding unavailable on this architecture");
+        console.log("SKIP testCancelDropsUploadAndBlocksRestart: node-libcurl binding unavailable on this architecture");
         return;
     }
 
-    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "clusterodm-restart-"));
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "clusterodm-cancel-"));
     fs.mkdirSync(path.join(workDir, "data"));
     fs.mkdirSync(path.join(workDir, "tmp"));
 
@@ -1164,6 +1163,8 @@ async function testCancelThenRestartLocalUpload(){
     const taskId = "88888888-8888-4888-8888-888888888888";
     let server = null;
     try{
+        floodMonitor.initialize();
+
         const servers = await proxy.initialize(new LocalCloudProvider());
         server = servers[0].server;
         await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
@@ -1193,6 +1194,7 @@ async function testCancelThenRestartLocalUpload(){
                     });
                 });
                 req.on("error", reject);
+                req.setTimeout(15000, () => req.destroy(new Error(`Timed out waiting for ${urlPath}`)));
                 if (payload) req.write(payload);
                 req.end();
             });
@@ -1204,7 +1206,7 @@ async function testCancelThenRestartLocalUpload(){
         const tmpPath = path.join("tmp", taskId);
         fs.mkdirSync(tmpPath);
         fs.writeFileSync(path.join(tmpPath, "body.json"), JSON.stringify({
-            taskName: "Restart me",
+            taskName: "Cancel me",
             options: "[]",
             imagesCount: 1
         }));
@@ -1213,7 +1215,7 @@ async function testCancelThenRestartLocalUpload(){
         await tasktable.add(taskId, {
             taskInfo: {
                 uuid: taskId,
-                name: "Restart me",
+                name: "Cancel me",
                 status: {code: statusCodes.QUEUED},
                 imagesCount: 1
             },
@@ -1221,33 +1223,27 @@ async function testCancelThenRestartLocalUpload(){
         }, "owner-a");
         await jobHistory.record(taskId, "created", {
             ownerKey: "owner-a",
-            name: "Restart me",
+            name: "Cancel me",
             imagesCount: 1,
             status: jobHistory.STATUS.QUEUED
         });
 
         const canceled = await request("POST", "/task/cancel?token=owner-a", formBody(taskId));
         assert.strictEqual(canceled.body.success, true, `expected cancel success, got ${JSON.stringify(canceled.body)}`);
-        assert.ok(fs.existsSync(path.join(tmpPath, "body.json")),
-                  "cancel must keep the gateway-held upload so Restart can re-dispatch it");
+        assert.ok(!fs.existsSync(tmpPath),
+                  "cancel must delete the gateway-held upload");
         assert.strictEqual((await jobHistory.lookup(taskId)).status, jobHistory.STATUS.CANCELED);
         const snapshot = await tasktable.lookup(taskId);
         assert.ok(snapshot && snapshot.taskInfo.status.code === statusCodes.CANCELED,
                   "the task table snapshot must show canceled");
 
         const restarted = await request("POST", "/task/restart?token=owner-a", formBody(taskId));
-        // No processing node is online in this fixture, so the re-dispatch itself
-        // fails — but it must get past "Action not supported" and clear the snapshot.
-        assert.ok(!restarted.body.error || restarted.body.error.indexOf("Action not supported") === -1,
-                  `restart must not hit the old dead-end, got ${JSON.stringify(restarted.body)}`);
-        assert.ok(restarted.body.uuid || restarted.body.error,
-                  `expected a uuid or a dispatch error, got ${JSON.stringify(restarted.body)}`);
-        assert.strictEqual(await tasktable.lookup(taskId), null,
-                           "restart must drop the canceled snapshot before re-dispatch");
-
-        const after = await jobHistory.lookup(taskId);
-        assert.ok(after.status !== jobHistory.STATUS.CANCELED,
-                  `restart must leave the ledger off canceled, got ${after.status}`);
+        assert.ok(restarted.body.error,
+                  `restart of a canceled job must fail, got ${JSON.stringify(restarted.body)}`);
+        assert.strictEqual(restarted.body.uuid, undefined,
+                           "restart must not re-dispatch a canceled job");
+        assert.strictEqual((await jobHistory.lookup(taskId)).status, jobHistory.STATUS.CANCELED,
+                           "restart must leave the ledger on canceled");
     }finally{
         if (server) await new Promise(resolve => server.close(resolve));
         process.chdir(originalCwd);
@@ -1306,6 +1302,109 @@ async function testCancelCleanupPreservesWorker(){
     }
 }
 
+// Settling a job clears its dispatch phase and drops it out of listNonTerminal(),
+// so a VM abandoned by a failed or canceled dispatch is invisible to every other
+// sweep. Its breadcrumb is the last thing that knows the machine exists.
+async function testAbandonedMachineReaper(){
+    const jobHistory = require("../libs/jobHistory");
+    const reconcile = require("../libs/reconcile");
+    const routetable = require("../libs/routetable");
+    const dispatchRegistry = require("../libs/dispatchRegistry");
+    const asrProvider = require("../libs/asrProvider");
+
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "clusterodm-abandoned-"));
+    fs.mkdirSync(path.join(workDir, "data"));
+    const originalCwd = process.cwd();
+    process.chdir(workDir);
+
+    const originalGet = asrProvider.get;
+    const destroyed = [];
+    const dispatching = "b1b1b1b1-b1b1-4b1b-8b1b-b1b1b1b1b1b1";
+
+    try{
+        await jobHistory.initialize(path.join("data", "jobs.json"));
+        await routetable.initialize();
+        asrProvider.get = () => ({destroyMachine: async name => { destroyed.push(name); }});
+
+        // The incident: three restarts raced, the winner's upload was deleted by
+        // a sibling, and its VM outlived the job that failed.
+        const failed = "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1";
+        await jobHistory.record(failed, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
+        await jobHistory.setDispatchMachine(failed, "clusterodm-abandoned");
+        await jobHistory.record(failed, "failed", {status: jobHistory.STATUS.FAILED});
+        assert.strictEqual((await jobHistory.lookup(failed)).dispatchPhase, null,
+                           "settling clears the phase, which is why the sweeps miss this");
+
+        // A claim still held means the machine may not even exist yet.
+        const claimed = "c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1";
+        await jobHistory.record(claimed, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
+        await jobHistory.setDispatchMachine(claimed, "clusterodm-claimed");
+        await jobHistory.setDispatchPhase(claimed, jobHistory.DISPATCH_PHASE.DISPATCHING);
+
+        // Canceled, phase cleared, but the dispatch is still unwinding and tears
+        // down its own machine when it does.
+        await jobHistory.record(dispatching, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
+        await jobHistory.setDispatchMachine(dispatching, "clusterodm-unwinding");
+        await jobHistory.record(dispatching, "canceled", {status: jobHistory.STATUS.CANCELED});
+        const unwindingToken = {};
+        dispatchRegistry.claim(dispatching, unwindingToken);
+
+        const result = await reconcile.reapAbandonedMachines();
+        assert.strictEqual(result.reaped, 1, `expected one reap, got ${JSON.stringify(result)}`);
+        assert.deepStrictEqual(destroyed, ["clusterodm-abandoned"]);
+        assert.strictEqual((await jobHistory.lookup(failed)).machine, null,
+                           "a reaped machine must not be reaped again next pass");
+        assert.strictEqual((await jobHistory.lookup(claimed)).machine.name, "clusterodm-claimed");
+        assert.strictEqual((await jobHistory.lookup(dispatching)).machine.name, "clusterodm-unwinding");
+
+        // Once that dispatch is gone without having freed its machine, the
+        // breadcrumb is the leak record and the next pass acts on it.
+        dispatchRegistry.release(dispatching, unwindingToken);
+        const second = await reconcile.reapAbandonedMachines();
+        assert.strictEqual(second.reaped, 1, `expected the unwound dispatch's machine, got ${JSON.stringify(second)}`);
+        assert.deepStrictEqual(destroyed, ["clusterodm-abandoned", "clusterodm-unwinding"]);
+
+        // A routed job's teardown belongs to nodes.json and the route table.
+        const routed = "e1e1e1e1-e1e1-4e1e-8e1e-e1e1e1e1e1e1";
+        await jobHistory.record(routed, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
+        await jobHistory.setDispatchMachine(routed, "clusterodm-routed");
+        await routetable.add(routed, new Node("127.0.0.1", 3998, "worker-token"), "owner-a");
+        assert.strictEqual((await reconcile.reapAbandonedMachines()).reaped, 0);
+        assert.strictEqual((await jobHistory.lookup(routed)).machine.name, "clusterodm-routed");
+    }finally{
+        asrProvider.get = originalGet;
+        process.chdir(originalCwd);
+    }
+}
+
+// One breadcrumb slot per job: an attempt that unwinds late must not erase the
+// name of a machine a later attempt is holding.
+async function testMachineBreadcrumbIsNameScoped(){
+    const jobHistory = require("../libs/jobHistory");
+
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "clusterodm-breadcrumb-"));
+    fs.mkdirSync(path.join(workDir, "data"));
+    const originalCwd = process.cwd();
+    process.chdir(workDir);
+
+    try{
+        await jobHistory.initialize(path.join("data", "jobs.json"));
+
+        const uuid = "d1d1d1d1-d1d1-4d1d-8d1d-d1d1d1d1d1d1";
+        await jobHistory.record(uuid, "created", {ownerKey: "owner-a", status: jobHistory.STATUS.QUEUED});
+        await jobHistory.setDispatchMachine(uuid, "clusterodm-second-attempt");
+
+        await jobHistory.clearDispatchMachine(uuid, "clusterodm-first-attempt");
+        assert.strictEqual((await jobHistory.lookup(uuid)).machine.name, "clusterodm-second-attempt",
+                           "a superseded attempt must not clear the live attempt's breadcrumb");
+
+        await jobHistory.clearDispatchMachine(uuid, "clusterodm-second-attempt");
+        assert.strictEqual((await jobHistory.lookup(uuid)).machine, null);
+    }finally{
+        process.chdir(originalCwd);
+    }
+}
+
 (async function(){
     await testRoutes();
     await testRouteTableDurability();
@@ -1321,8 +1420,10 @@ async function testCancelCleanupPreservesWorker(){
     await testLedgerAwareCleanup();
     await testRemoveWithoutRoute();
     await testInfoSurvivesWorkerTeardown();
-    await testCancelThenRestartLocalUpload();
+    await testCancelDropsUploadAndBlocksRestart();
     await testCancelCleanupPreservesWorker();
+    await testAbandonedMachineReaper();
+    await testMachineBreadcrumbIsNameScoped();
     console.log("All tests passed");
 
     // The proxy's housekeeping intervals keep the event loop alive.

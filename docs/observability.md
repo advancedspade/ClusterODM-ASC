@@ -57,7 +57,7 @@ the HTTP response finishing, so on a fast static dispatch it can land after
 | `task.queued` | No capacity; waiting for a node |
 | `task.dispatch.retained` | Persisted worker unreachable; claim held and re-probed rather than released |
 | `task.dispatch.reset` | Dispatch recovery cleared a phase left behind by a restart |
-| `task.machine.reaped` | Destroyed the autoscaled VM a released or orphaned job was holding |
+| `task.machine.reaped` | Destroyed the autoscaled VM a released, orphaned or settled job was holding |
 | `task.machine.reap.failed` | That VM could not be destroyed; `machine` names what to check by hand |
 | `task.recovered` | Orphan sweep found the task alive on a worker and healed the ledger |
 | `task.orphaned` | Orphan sweep gave up and marked the task failed |
@@ -98,6 +98,12 @@ gcloud logging read \
 
 Read it against the healthy sequence above. Where it stops tells you the phase:
 
+- more than one `task.commit.accepted` for the same uuid — the upload was
+  dispatched more than once, and the attempts raced over `tmp/<uuid>` and the
+  autoscaled VM. `restart=true` on the extras means a cancel/restart burst;
+  those are refused while the previous attempt is unwinding, so a recurrence
+  means the guard is not holding. Expect an abandoned worker and pair it with
+  `task.machine.reaped` for the same task.
 - stops after `task.upload.batch` — the commit never arrived, so the browser
   lost the connection before sending it. Look for a matching `client.error`.
 - `task.commit.responded` with `outcome="aborted"` — the gateway did the work
