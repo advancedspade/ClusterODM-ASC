@@ -292,11 +292,9 @@ module.exports = {
             if (job.dispatchPhase === DISPATCH_PHASE.ROUTED){
                 return {accepted: false, reason: 'routed', revived: false, job, saved: nothingWritten};
             }
-            if (job.status === STATUS.DELETED){
-                return {accepted: false, reason: job.status, revived: false, job, saved: nothingWritten};
-            }
-            // An explicit restart may revive a canceled job; a plain commit may not.
-            if (job.status === STATUS.CANCELED && !options.allowRestart){
+            // Canceled and deleted are final. A plain commit may not revive them,
+            // and Restart is not offered for cancel either.
+            if (job.status === STATUS.CANCELED || job.status === STATUS.DELETED){
                 return {accepted: false, reason: job.status, revived: false, job, saved: nothingWritten};
             }
             if (job.status === STATUS.SUCCEEDED){
@@ -306,9 +304,7 @@ module.exports = {
 
         // A job the orphan sweeper already failed is still resumable as long as
         // its uploaded files survived, so accept and let the caller revive it.
-        // An explicit restart can also revive a canceled job whose upload is intact.
-        const revived = !!job && (job.status === STATUS.FAILED ||
-            (options.allowRestart && job.status === STATUS.CANCELED));
+        const revived = !!job && job.status === STATUS.FAILED;
 
         const target = job || newRecord(uuid, options.ownerKey, now);
         if (!job) jobs[uuid] = target;
@@ -385,11 +381,16 @@ module.exports = {
      * Forgets the machine, which means "nobody needs to reap this any more" —
      * either it was destroyed or it never existed. Survives a settled status on
      * purpose: a breadcrumb we failed to act on is the record of a leaked VM.
+     *
+     * @param name {String} when given, only clears if the slot still names this
+     *        machine. There is one slot per job, so an attempt that unwinds late
+     *        would otherwise erase the name of a VM a later attempt is holding.
      */
-    clearDispatchMachine: async function(uuid){
+    clearDispatchMachine: async function(uuid, name){
         if (!uuid || !jobs) return null;
         const job = jobs[uuid];
         if (!job || !job.machine) return job || null;
+        if (name && job.machine.name !== name) return job;
 
         job.machine = null;
         job.updatedAt = new Date().getTime();
@@ -454,6 +455,19 @@ module.exports = {
         return Object.keys(jobs)
             .map(uuid => jobs[uuid])
             .filter(job => !isTerminal(job.status));
+    },
+
+    /**
+     * Jobs still naming an autoscaled machine, terminal ones included. Reaching
+     * an outcome clears the dispatch phase and drops the job out of
+     * listNonTerminal(), so a breadcrumb that outlives its job is invisible to
+     * every other sweep — which is exactly the leaked-VM case.
+     */
+    listWithMachines: async function(){
+        if (!jobs) return [];
+        return Object.keys(jobs)
+            .map(uuid => jobs[uuid])
+            .filter(job => job.machine && job.machine.name);
     },
 
     /**

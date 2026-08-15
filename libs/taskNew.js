@@ -30,12 +30,15 @@ const odmOptions = require('./odmOptions');
 const statusCodes = require('./statusCodes');
 const asrProvider = require('./asrProvider');
 const capacityEvents = require('./capacityEvents');
+const dispatchRegistry = require('./dispatchRegistry');
 const logger = require('./logger');
 const events = require('events');
 
 // FIFO of tasks waiting for a processing slot (all instanceLimit workers busy).
 // In-memory only, like tasktable/routetable; does not survive a gateway restart.
 let queuedTasks = [];
+
+const abortedError = () => Object.assign(new Error("Task was canceled"), {aborted: true});
 
 const assureUniqueFilename = (dstPath, filename) => {
     return new Promise((resolve, _) => {
@@ -350,8 +353,23 @@ module.exports = {
     // submission path and by tryDispatchQueue() once a queued task gets a slot.
     // `res` is null when dispatching a previously queued task, since the
     // client was already responded to when the task was queued.
-    _dispatch: async function({ node, autoscale, req, res, uuid, tmpPath, params, token, limits, getLimitedOptions, actor }){
+    _dispatch: async function(args){
+        const dispatchToken = {};
+        dispatchRegistry.claim(args.uuid, dispatchToken);
+        try{
+            return await this._runDispatch(args, dispatchToken);
+        }finally{
+            dispatchRegistry.release(args.uuid, dispatchToken);
+        }
+    },
+
+    _runDispatch: async function({ node, autoscale, req, res, uuid, tmpPath, params, token, limits, getLimitedOptions, actor }, dispatchToken){
         const { options, taskName, skipPostProcessing, outputs, dateCreated, fileNames, imagesCount, webhook, reprocessProject } = params;
+
+        // False once a newer dispatch has taken over this uuid. Everything
+        // destructive below is shared state, so a superseded attempt must not
+        // delete the upload, settle the ledger row, or touch the task table.
+        const ownsDispatch = () => dispatchRegistry.owns(uuid, dispatchToken);
 
         await jobHistory.setDispatchPhase(uuid, jobHistory.DISPATCH_PHASE.DISPATCHING);
         logger.event('task.dispatch.start', {
@@ -519,7 +537,10 @@ module.exports = {
                     const body = fileNames.map(f => { return { name: 'images', file: path.join(tmpPath, f) } });
                     
                     const curl = curlInstance(done, async (err) => {
-                            if (status.aborted) return; // Ignore if this was aborted by other code
+                            // Settle rather than return: an unsettled promise
+                            // strands the dispatch, and everything waiting on it
+                            // to unwind (Restart, the machine teardown) hangs too.
+                            if (status.aborted) return reject(abortedError());
 
                             if (retries < MAX_RETRIES){
                                 retries++;
@@ -557,19 +578,74 @@ module.exports = {
             status.aborted = true;
         });
 
+        // Signals only. Destroying the VM from here races createNode, which is
+        // still working through its zone ladder and would either recreate the
+        // instance or fail against a half-deleted one. The dispatch tears down
+        // its own machine as it unwinds.
         const abortTask = () => {
             eventEmitter.emit('abort');
-            if (dmHostname && autoscale){
-                const asr = asrProvider.get();
-                try{
-                    asr.destroyMachine(dmHostname);
-                }catch(e){
-                    logger.warn(`Could not destroy machine ${dmHostname}: ${e}`);
-                }
+        };
+
+        // Frees the autoscaled VM this dispatch asked for. Every path that ends
+        // without routing has to call it: no route exists to own the teardown,
+        // and settling the ledger row drops the job out of the non-terminal
+        // listings, so the breadcrumb stops being visible to reconcile.
+        const releaseMachine = async () => {
+            if (!autoscale || !dmHostname) return;
+
+            const asr = asrProvider.get();
+            // Nothing can free it without an ASR. Keep the breadcrumb: a logged
+            // name is recoverable, a forgotten one is not.
+            if (!asr){
+                logger.event('task.machine.reap.failed', {
+                    taskId: uuid,
+                    machine: dmHostname,
+                    detail: 'autoscaler unavailable',
+                    level: 'warn'
+                });
+                return;
+            }
+
+            try{
+                // Go through netutils once the worker registered, so nodes.json
+                // and the route table stop naming a VM that is going away.
+                const registered = nodes.find(n => n.getDockerMachineName() === dmHostname);
+                if (registered) await netutils.removeAndCleanupNode(registered, asr);
+                else await asr.destroyMachine(dmHostname);
+
+                await jobHistory.clearDispatchMachine(uuid, dmHostname);
+                logger.event('task.machine.reaped', {
+                    taskId: uuid,
+                    machine: dmHostname,
+                    detail: 'dispatch ended without routing'
+                });
+            }catch(e){
+                logger.event('task.machine.reap.failed', {
+                    taskId: uuid,
+                    machine: dmHostname,
+                    detail: e.message,
+                    level: 'warn'
+                });
             }
         };
 
         const handleError = async (err) => {
+            // tmp/<uuid> and the ledger row belong to whichever dispatch owns the
+            // uuid now. A superseded attempt that cleaned them up would delete
+            // the images its replacement is uploading.
+            if (!ownsDispatch()){
+                logger.warn(`Superseded dispatch for ${uuid} ended: ${err.message}`);
+                await releaseMachine();
+                return;
+            }
+
+            // A cancel has already settled the status and deleted the upload.
+            if (status.aborted){
+                await releaseMachine();
+                eventEmitter.emit('close');
+                return;
+            }
+
             const taskTableEntry = await tasktable.lookup(uuid);
             if (taskTableEntry){
                 const taskInfo = taskTableEntry.taskInfo;
@@ -595,6 +671,7 @@ module.exports = {
                 detail: err.message
             });
             utils.rmdir(tmpPath);
+            await releaseMachine();
             eventEmitter.emit('close');
         };
 
@@ -610,6 +687,10 @@ module.exports = {
                 if (!autoscale) node.decTransients();
             }catch(e){
                 if (!autoscale) node.decTransients();
+
+                // Retrying a canceled task would upload to a worker nobody is
+                // waiting on and hold the uuid against a pending Restart.
+                if (status.aborted) throw e;
 
                 // Attempt to retry
                 if (retries < MAX_UPLOAD_RETRIES){
@@ -661,25 +742,6 @@ module.exports = {
         if (autoscale){
             const asr = asrProvider.get();
 
-            // createNode tears the machine down on its own failure paths, but it
-            // swallows a failed teardown. Confirm the VM is gone before dropping
-            // the only record of its name, and leave the breadcrumb behind if we
-            // cannot: a logged name is recoverable, a forgotten one is not.
-            const discardMachine = async () => {
-                if (!dmHostname) return;
-                try{
-                    await asr.destroyMachine(dmHostname);
-                    await jobHistory.clearDispatchMachine(uuid);
-                }catch(e){
-                    logger.event('task.machine.reap.failed', {
-                        taskId: uuid,
-                        machine: dmHostname,
-                        detail: e.message,
-                        level: 'warn'
-                    });
-                }
-            };
-
             try{
                 dmHostname = asr.generateHostname(imagesCount);
                 // createNode can spend minutes waiting for the VM to boot, and
@@ -687,9 +749,9 @@ module.exports = {
                 // first so reconcile can reap it if we die in that window.
                 await jobHistory.setDispatchMachine(uuid, dmHostname);
                 node = await asr.createNode(req, imagesCount, token, dmHostname, status);
-                if (!status.aborted) nodes.add(node);
+                if (!status.aborted && ownsDispatch()) nodes.add(node);
                 else{
-                    await discardMachine();
+                    await releaseMachine();
                     return;
                 }
                 // Persist before doUpload: if we die after the worker accepts
@@ -703,10 +765,9 @@ module.exports = {
                     autoscale: true
                 });
             }catch(e){
-                await discardMachine();
                 const err = new Error("No nodes available (attempted to autoscale but failed). Try again later.");
                 logger.warn(`Cannot create node via autoscaling: ${e.message}`);
-                handleError(err);
+                await handleError(err);
                 // A pending-creation slot just freed up; give the queue a chance.
                 capacityEvents.emit('changed');
                 return;
@@ -717,11 +778,18 @@ module.exports = {
             await doUpload();
             eventEmitter.emit('close');
 
+            // Routing publishes this worker as the owner of the uuid. A dispatch
+            // that has been superseded would publish it over its replacement's.
+            if (!ownsDispatch()){
+                await releaseMachine();
+                return;
+            }
+
             await routetable.add(uuid, node, token);
             // The route and nodes.json now own this VM's teardown, so the
             // breadcrumb's job is done. It only ever means "a machine exists
             // that nothing else tracks".
-            await jobHistory.clearDispatchMachine(uuid);
+            if (dmHostname) await jobHistory.clearDispatchMachine(uuid, dmHostname);
             await tasktable.delete(uuid);
             await jobHistory.setDispatchNode(uuid, node);
             await jobHistory.record(uuid, 'routed', {
@@ -740,7 +808,7 @@ module.exports = {
 
             utils.rmdir(tmpPath);
         }catch(e){
-            handleError(e);
+            await handleError(e);
         }
     },
 

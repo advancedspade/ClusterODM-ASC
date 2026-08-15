@@ -37,6 +37,7 @@ const routetable = require('./routetable');
 const tasktable = require('./tasktable');
 const nodes = require('./nodes');
 const netutils = require('./netutils');
+const dispatchRegistry = require('./dispatchRegistry');
 const asrProvider = require('./asrProvider');
 const statusCodes = require('./statusCodes');
 const Node = require('./classes/Node');
@@ -171,7 +172,7 @@ async function reapMachine(job, detail){
         if (registered) await netutils.removeAndCleanupNode(registered, asr);
         else await asr.destroyMachine(name);
 
-        await jobHistory.clearDispatchMachine(job.uuid);
+        await jobHistory.clearDispatchMachine(job.uuid, name);
         logger.event('task.machine.reaped', {taskId: job.uuid, machine: name, detail});
         return true;
     }catch(e){
@@ -366,6 +367,33 @@ async function sweep(){
 }
 
 /**
+ * Destroys machines whose job has already settled. The sweeps above only walk
+ * non-terminal jobs, so a VM abandoned by a failed or canceled dispatch is
+ * invisible to them: reaching an outcome clears the dispatch phase and drops
+ * the row from that listing while the breadcrumb — the only durable name of a
+ * machine nothing else tracks — stays behind.
+ */
+async function reapAbandonedMachines(){
+    let reaped = 0;
+
+    for (const job of await jobHistory.listWithMachines()){
+        // A phase still set means a dispatch holds a claim, and the machine may
+        // not even exist yet. Only a claimless breadcrumb is abandoned.
+        if (job.dispatchPhase) continue;
+        // Cancel clears the phase while the dispatch is still unwinding, and
+        // that dispatch tears down its own machine when it does.
+        if (dispatchRegistry.isDispatching(job.uuid)) continue;
+        // A route means nodes.json and the route table already own the teardown.
+        if (await routetable.lookup(job.uuid)) continue;
+
+        if (await reapMachine(job, `job ${job.status} with a machine still assigned`)) reaped++;
+    }
+
+    if (reaped) logger.info(`Reaped ${reaped} abandoned autoscaled machine(s)`);
+    return {reaped};
+}
+
+/**
  * Non-terminal jobs that the sweeper would settle right now. Read-only, so the
  * admin CLI can show what is at risk before anything is changed.
  */
@@ -401,12 +429,15 @@ module.exports = {
         }
 
         await sweep();
+        await reapAbandonedMachines();
         setInterval(() => {
             // Claim recovery re-runs so a worker that was unreachable last pass is
             // asked again, instead of a single startup timeout deciding the fate of
             // a task that may still be processing.
             recoverDispatchClaims()
                 .then(sweep)
+                // Last, so it sees the breadcrumbs the passes above just settled.
+                .then(reapAbandonedMachines)
                 .catch(e => logger.warn(`Reconcile pass failed: ${e.message}`));
         }, SWEEP_INTERVAL);
     },
@@ -414,6 +445,7 @@ module.exports = {
     hasLiveDispatch,
     recoverDispatchClaims,
     sweep,
+    reapAbandonedMachines,
     findOrphans,
     probeWorker
 };
