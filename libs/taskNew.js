@@ -40,6 +40,11 @@ let queuedTasks = [];
 
 const abortedError = () => Object.assign(new Error("Task was canceled"), {aborted: true});
 
+// Worker URLs carry the per-VM node token as a query parameter. Dispatch errors
+// end up in Cloud Logging and in the message handed back to API clients, so only
+// the path is safe to quote.
+const withoutQuery = (url) => String(url).split('?')[0];
+
 const assureUniqueFilename = (dstPath, filename) => {
     return new Promise((resolve, _) => {
         const dstFile = path.join(dstPath, filename);
@@ -445,7 +450,7 @@ module.exports = {
 
                         done();
                     }else{
-                        const err = new Error(`POST ${url} statusCode is ${statusCode}, expected 200`);
+                        const err = new Error(`POST ${withoutQuery(url)} statusCode is ${statusCode}, expected 200`);
                         // 4xx means the worker understood the request and turned
                         // it down; 5xx can still be a worker that is coming up.
                         if (statusCode >= 400 && statusCode < 500) err.rejected = true;
@@ -881,6 +886,8 @@ module.exports = {
         // process() and this task landing in the queue.
         module.exports.tryDispatchQueue().catch(e => logger.warn(`Queue dispatch failed: ${e.message}`));
     },
+
+    _withoutQuery: withoutQuery,
 
     _refreshQueuePositions: function(){
         queuedTasks.forEach((entry, idx) => {

@@ -1272,6 +1272,31 @@ async function testCancelDropsUploadAndBlocksRestart(){
     }
 }
 
+// Dispatch failures are logged and handed to API clients, so the per-VM worker
+// token that rides along on the URL must not travel with them.
+async function testWorkerTokenNotInDispatchErrors(){
+    let taskNew = null;
+    try{
+        taskNew = require("../libs/taskNew");
+    }catch(e){
+        if (String(e.message).indexOf("node_libcurl.node") === -1) throw e;
+        console.log("SKIP testWorkerTokenNotInDispatchErrors: node-libcurl binding unavailable on this architecture");
+        return;
+    }
+
+    const redact = taskNew._withoutQuery;
+
+    assert.strictEqual(redact("http://10.0.0.4:3000/task/new/init?token=s3cret"),
+                       "http://10.0.0.4:3000/task/new/init",
+                       "the token query must be stripped");
+    assert.strictEqual(redact("http://10.0.0.4:3000/task/new/commit/uuid"),
+                       "http://10.0.0.4:3000/task/new/commit/uuid",
+                       "a url with no query is left alone");
+    assert.strictEqual(redact("http://10.0.0.4:3000/x?token=a&b=c"),
+                       "http://10.0.0.4:3000/x",
+                       "everything after the first ? goes, not just the token");
+}
+
 // Cancel frees a project name, but only if this job is the one holding it.
 async function testProjectNameOwnershipGuard(){
     const jobHistory = require("../libs/jobHistory");
@@ -1589,6 +1614,7 @@ async function testMachineBreadcrumbIsNameScoped(){
     await testLedgerAwareCleanup();
     await testRemoveWithoutRoute();
     await testInfoSurvivesWorkerTeardown();
+    await testWorkerTokenNotInDispatchErrors();
     await testProjectNameOwnershipGuard();
     await testCancelDropsUploadAndBlocksRestart();
     await testDuplicateProjectNameRejectedBeforeUpload();
