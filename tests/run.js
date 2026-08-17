@@ -1140,6 +1140,7 @@ async function testCancelDropsUploadAndBlocksRestart(){
     const tasktable = require("../libs/tasktable");
     const statusCodes = require("../libs/statusCodes");
     const floodMonitor = require("../libs/floodMonitor");
+    const gcsProjects = require("../libs/gcsProjects");
     const LocalCloudProvider = require("../libs/cloud-providers/LocalCloudProvider");
 
     let proxy = null;
@@ -1161,6 +1162,15 @@ async function testCancelDropsUploadAndBlocksRestart(){
     process.chdir(workDir);
 
     const taskId = "88888888-8888-4888-8888-888888888888";
+    const originalEnabled = gcsProjects.enabled;
+    const originalRemove = gcsProjects.remove;
+    const releasedProjects = [];
+    gcsProjects.enabled = () => true;
+    gcsProjects.remove = async (project) => {
+        releasedProjects.push(project);
+        return {removed: true};
+    };
+
     let server = null;
     try{
         floodMonitor.initialize();
@@ -1237,6 +1247,15 @@ async function testCancelDropsUploadAndBlocksRestart(){
         assert.ok(snapshot && snapshot.taskInfo.status.code === statusCodes.CANCELED,
                   "the task table snapshot must show canceled");
 
+        // Cancel answers before the bucket delete finishes.
+        let released = false;
+        for (let i = 0; i < 40; i++){
+            if (releasedProjects.length){ released = true; break; }
+            await new Promise(resolve => setTimeout(resolve, 25));
+        }
+        assert.ok(released, "cancel must free the cloud project name for reuse");
+        assert.deepStrictEqual(releasedProjects, ["Cancel_me"]);
+
         const restarted = await request("POST", "/task/restart?token=owner-a", formBody(taskId));
         assert.ok(restarted.body.error,
                   `restart of a canceled job must fail, got ${JSON.stringify(restarted.body)}`);
@@ -1248,6 +1267,181 @@ async function testCancelDropsUploadAndBlocksRestart(){
         if (server) await new Promise(resolve => server.close(resolve));
         process.chdir(originalCwd);
         config.token = originalToken;
+        gcsProjects.enabled = originalEnabled;
+        gcsProjects.remove = originalRemove;
+    }
+}
+
+// Dispatch failures are logged and handed to API clients, so the per-VM worker
+// token that rides along on the URL must not travel with them.
+async function testWorkerTokenNotInDispatchErrors(){
+    let taskNew = null;
+    try{
+        taskNew = require("../libs/taskNew");
+    }catch(e){
+        if (String(e.message).indexOf("node_libcurl.node") === -1) throw e;
+        console.log("SKIP testWorkerTokenNotInDispatchErrors: node-libcurl binding unavailable on this architecture");
+        return;
+    }
+
+    const redact = taskNew._withoutQuery;
+
+    assert.strictEqual(redact("http://10.0.0.4:3000/task/new/init?token=s3cret"),
+                       "http://10.0.0.4:3000/task/new/init",
+                       "the token query must be stripped");
+    assert.strictEqual(redact("http://10.0.0.4:3000/task/new/commit/uuid"),
+                       "http://10.0.0.4:3000/task/new/commit/uuid",
+                       "a url with no query is left alone");
+    assert.strictEqual(redact("http://10.0.0.4:3000/x?token=a&b=c"),
+                       "http://10.0.0.4:3000/x",
+                       "everything after the first ? goes, not just the token");
+}
+
+// Cancel frees a project name, but only if this job is the one holding it.
+async function testProjectNameOwnershipGuard(){
+    const jobHistory = require("../libs/jobHistory");
+    await jobHistory.initialize(tempHistoryFile());
+
+    const winner = "c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1";
+    const loser = "d1d1d1d1-d1d1-4d1d-8d1d-d1d1d1d1d1d1";
+    const twin = "e1e1e1e1-e1e1-4e1e-8e1e-e1e1e1e1e1e1";
+
+    await jobHistory.record(winner, "created", {name: "Shared name", status: jobHistory.STATUS.RUNNING});
+    await jobHistory.record(loser, "created", {name: "Shared name", status: jobHistory.STATUS.QUEUED});
+
+    assert.strictEqual((await jobHistory.activeWithProjectName(loser, "Shared name")).length, 1,
+                       "a job still running under the name must block the release");
+    assert.strictEqual((await jobHistory.activeWithProjectName(loser, "Other name")).length, 0,
+                       "an unrelated name must not block anything");
+
+    await jobHistory.record(winner, "finished", {status: jobHistory.STATUS.SUCCEEDED, force: true});
+    assert.strictEqual((await jobHistory.activeWithProjectName(loser, "Shared name")).length, 0,
+                       "a settled job no longer holds the name");
+
+    await jobHistory.record(twin, "created", {name: "Shared  name", status: jobHistory.STATUS.RUNNING});
+    assert.strictEqual((await jobHistory.activeWithProjectName(loser, "Shared name")).length, 1,
+                       "names are compared sanitized, the way the folder is named");
+}
+
+// A taken project name must be refused at init. The worker catches it too, but
+// only after a full upload and a VM boot, and reports it as a forwarding error.
+async function testDuplicateProjectNameRejectedBeforeUpload(){
+    const nodesLib = require("../libs/nodes");
+    const floodMonitor = require("../libs/floodMonitor");
+    const gcsProjects = require("../libs/gcsProjects");
+    const LocalCloudProvider = require("../libs/cloud-providers/LocalCloudProvider");
+
+    let proxy = null;
+    try{
+        proxy = require("../libs/proxy");
+    }catch(e){
+        if (String(e.message).indexOf("node_libcurl.node") === -1) throw e;
+        console.log("SKIP testDuplicateProjectNameRejectedBeforeUpload: node-libcurl binding unavailable on this architecture");
+        return;
+    }
+
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "clusterodm-dupname-"));
+    fs.mkdirSync(path.join(workDir, "data"));
+    fs.mkdirSync(path.join(workDir, "tmp"));
+
+    const originalCwd = process.cwd();
+    const originalToken = config.token;
+    const originalEnabled = gcsProjects.enabled;
+    const originalExists = gcsProjects.exists;
+    config.token = "";
+    process.chdir(workDir);
+
+    const worker = http.createServer((req, res) => {
+        res.writeHead(200, {"Content-Type": "application/json"});
+        if (req.url.indexOf("/options") === 0) res.end("[]");
+        else res.end(JSON.stringify({
+            version: "1.5.3", maxParallelTasks: 1, taskQueueCount: 0,
+            engine: "odm", engineVersion: "3.0.0"
+        }));
+    });
+
+    let taken = true;
+    const asked = [];
+    gcsProjects.enabled = () => true;
+    gcsProjects.exists = async (project) => {
+        asked.push(project);
+        return taken;
+    };
+
+    let server = null;
+    try{
+        floodMonitor.initialize();
+        await new Promise(resolve => worker.listen(0, "127.0.0.1", resolve));
+
+        const servers = await proxy.initialize(new LocalCloudProvider());
+        server = servers[0].server;
+        await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+        const port = server.address().port;
+
+        const node = new Node("127.0.0.1", worker.address().port, "worker-token");
+        nodesLib.add(node);
+        await node.updateInfo();
+
+        const init = (taskName) => {
+            const payload = Buffer.from(
+                `------t\r\nContent-Disposition: form-data; name="name"\r\n\r\n${taskName}\r\n` +
+                `------t\r\nContent-Disposition: form-data; name="options"\r\n\r\n[]\r\n------t--\r\n`
+            );
+            return new Promise((resolve, reject) => {
+                const req = http.request({
+                    host: "127.0.0.1",
+                    port,
+                    path: "/task/new/init?token=owner-a",
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "multipart/form-data; boundary=----t",
+                        "Content-Length": payload.length
+                    }
+                }, res => {
+                    let data = "";
+                    res.on("data", c => { data += c; });
+                    res.on("end", () => {
+                        try{
+                            resolve(JSON.parse(data));
+                        }catch(e){
+                            reject(new Error(`Bad JSON from /task/new/init: ${data}`));
+                        }
+                    });
+                });
+                req.on("error", reject);
+                req.setTimeout(15000, () => req.destroy(new Error("Timed out waiting for /task/new/init")));
+                req.write(payload);
+                req.end();
+            });
+        };
+
+        const rejected = await init("Test Cabcel");
+        assert.ok(rejected.error && /already exists/.test(rejected.error),
+                  `a taken name must be refused at init, got ${JSON.stringify(rejected)}`);
+        assert.strictEqual(rejected.uuid, undefined, "a refused init must not hand back a uuid");
+        assert.deepStrictEqual(asked, ["Test_Cabcel"], "the sanitized name is what gets checked");
+
+        // die() answers the client and cleans up in the background.
+        const tmpDrained = async () => {
+            for (let i = 0; i < 40; i++){
+                if (!fs.readdirSync("tmp").length) return true;
+                await new Promise(resolve => setTimeout(resolve, 50));
+            }
+            return false;
+        };
+        assert.ok(await tmpDrained(),
+                  "a refused init must not leave an upload directory behind");
+
+        taken = false;
+        const accepted = await init("Test Cabcel");
+        assert.ok(accepted.uuid, `a free name must be accepted, got ${JSON.stringify(accepted)}`);
+    }finally{
+        if (server) await new Promise(resolve => server.close(resolve));
+        await new Promise(resolve => worker.close(resolve));
+        process.chdir(originalCwd);
+        config.token = originalToken;
+        gcsProjects.enabled = originalEnabled;
+        gcsProjects.exists = originalExists;
     }
 }
 
@@ -1420,7 +1614,10 @@ async function testMachineBreadcrumbIsNameScoped(){
     await testLedgerAwareCleanup();
     await testRemoveWithoutRoute();
     await testInfoSurvivesWorkerTeardown();
+    await testWorkerTokenNotInDispatchErrors();
+    await testProjectNameOwnershipGuard();
     await testCancelDropsUploadAndBlocksRestart();
+    await testDuplicateProjectNameRejectedBeforeUpload();
     await testCancelCleanupPreservesWorker();
     await testAbandonedMachineReaper();
     await testMachineBreadcrumbIsNameScoped();
