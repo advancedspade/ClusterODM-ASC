@@ -1212,7 +1212,10 @@ module.exports = {
                                     }
 
                                     await recordAction();
-                                    if (pathname === '/task/cancel') await releaseGcsProject();
+                                    // Bucket delete retries must not delay the
+                                    // cancel response; failures still land as
+                                    // task.project.release.failed in the log.
+                                    if (pathname === '/task/cancel') releaseGcsProject();
                                     json(res, { success: true });
                                 }else if (pathname === '/task/restart'){
                                     if (await restartFromLocalUpload()) return;
@@ -1241,7 +1244,7 @@ module.exports = {
                                     // Jobs predating the history ledger have no row to
                                     // update, but the client still needs to drop them.
                                     if (job) await recordAction();
-                                    if (job && pathname === '/task/cancel') await releaseGcsProject();
+                                    if (job && pathname === '/task/cancel') releaseGcsProject();
 
                                     json(res, { success: true });
                                 }

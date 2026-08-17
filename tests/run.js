@@ -1246,8 +1246,15 @@ async function testCancelDropsUploadAndBlocksRestart(){
         const snapshot = await tasktable.lookup(taskId);
         assert.ok(snapshot && snapshot.taskInfo.status.code === statusCodes.CANCELED,
                   "the task table snapshot must show canceled");
-        assert.deepStrictEqual(releasedProjects, ["Cancel_me"],
-                               "cancel must free the cloud project name for reuse");
+
+        // Cancel answers before the bucket delete finishes.
+        let released = false;
+        for (let i = 0; i < 40; i++){
+            if (releasedProjects.length){ released = true; break; }
+            await new Promise(resolve => setTimeout(resolve, 25));
+        }
+        assert.ok(released, "cancel must free the cloud project name for reuse");
+        assert.deepStrictEqual(releasedProjects, ["Cancel_me"]);
 
         const restarted = await request("POST", "/task/restart?token=owner-a", formBody(taskId));
         assert.ok(restarted.body.error,
