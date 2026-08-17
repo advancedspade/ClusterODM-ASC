@@ -116,6 +116,9 @@ function newRecord(uuid, ownerKey, now){
         uuid,
         ownerKey: ownerKey || null,
         name: null,
+        // Whether the job was pointed at an existing cloud project. Cancel frees
+        // the project name it was holding, and a reprocess never owned one.
+        reprocess: false,
         status: STATUS.QUEUED,
         statusCode: statusCodes.QUEUED,
         imagesCount: null,
@@ -471,6 +474,23 @@ module.exports = {
     },
 
     /**
+     * Other unsettled jobs working under the same project name. Two uploads can
+     * pass the name check together and only collide at dispatch; the loser's
+     * cancel must not then delete the folder the winner is filling.
+     */
+    activeWithProjectName: async function(uuid, name){
+        if (!jobs) return [];
+        const target = sanitizeProjectName(name, "");
+        if (!target) return [];
+
+        return Object.keys(jobs)
+            .map(key => jobs[key])
+            .filter(job => job.uuid !== uuid &&
+                           !isTerminal(job.status) &&
+                           sanitizeProjectName(job.name, "") === target);
+    },
+
+    /**
      * Last known worker for a job. Prefers the persisted worker record (which
      * carries the auth token) and falls back to the `routed` event's host:port.
      */
@@ -553,6 +573,7 @@ module.exports = {
 
         if (options.ownerKey && !job.ownerKey) job.ownerKey = options.ownerKey;
         if (options.name) job.name = options.name;
+        if (options.reprocess !== undefined) job.reprocess = !!options.reprocess;
         if (options.imagesCount !== undefined && options.imagesCount !== null){
             job.imagesCount = options.imagesCount;
         }
@@ -725,6 +746,7 @@ module.exports = {
                     if (job.dispatchPhase === undefined) job.dispatchPhase = null;
                     if (job.dispatchAcceptedAt === undefined) job.dispatchAcceptedAt = null;
                     if (job.machine === undefined) job.machine = null;
+                    if (job.reprocess === undefined) job.reprocess = false;
                 });
                 const hasProjects = content.projects && typeof content.projects === 'object';
                 const loadedProjects = hasProjects ? content.projects : {};

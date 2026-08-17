@@ -437,12 +437,19 @@ module.exports = {
                 try{
                     if (statusCode === 200){
                         body = JSON.parse(body);
-                        if (body.error) throw new Error(body.error);
+                        // The worker answered and refused. A taken project name
+                        // or a rejected option reads the same on every attempt,
+                        // so retrying only delays the answer.
+                        if (body.error) throw Object.assign(new Error(body.error), {rejected: true});
                         if (validate !== undefined) validate(body);
 
                         done();
                     }else{
-                        throw new Error(`POST ${url} statusCode is ${statusCode}, expected 200`);
+                        const err = new Error(`POST ${url} statusCode is ${statusCode}, expected 200`);
+                        // 4xx means the worker understood the request and turned
+                        // it down; 5xx can still be a worker that is coming up.
+                        if (statusCode >= 400 && statusCode < 500) err.rejected = true;
+                        throw err;
                     }
                 }catch(e){
                     onError(e);
@@ -541,6 +548,7 @@ module.exports = {
                             // strands the dispatch, and everything waiting on it
                             // to unwind (Restart, the machine teardown) hangs too.
                             if (status.aborted) return reject(abortedError());
+                            if (err.rejected) return reject(err);
 
                             if (retries < MAX_RETRIES){
                                 retries++;
@@ -692,6 +700,11 @@ module.exports = {
                 // waiting on and hold the uuid against a pending Restart.
                 if (status.aborted) throw e;
 
+                // A refusal is the worker's final answer. Retrying it spends
+                // another minute and keeps a VM booted to be told the same
+                // thing, and buries the reason under the exhaustion message.
+                if (e.rejected) throw e;
+
                 // Attempt to retry
                 if (retries < MAX_UPLOAD_RETRIES){
                     retries++;
@@ -719,7 +732,7 @@ module.exports = {
 
                     await doUpload();
                 }else{
-                    throw new Error(`Failed to forward task to processing node after ${retries} attempts. Try again later.`);
+                    throw new Error(`Failed to forward task to processing node after ${retries} attempts: ${e.message}`);
                 }
             }
         };

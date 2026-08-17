@@ -44,6 +44,7 @@ const concurrencyMonitor = require('./concurrencyMonitor');
 const AWS = require('aws-sdk');
 const ascUiRoutes = require('./ascUiRoutes');
 const {sanitizeProjectName} = require('./gcsProjectName');
+const gcsProjects = require('./gcsProjects');
 const querystring = require('querystring');
 const events = require('events');
 
@@ -489,6 +490,9 @@ module.exports = {
         };
 
         const numberField = (value) => {
+            // Number(null) is 0, which would report an absent measurement as a
+            // real zero — "sessionMs=0" reads as a fact rather than a gap.
+            if (value === null || value === undefined || value === '') return null;
             const num = Number(value);
             return Number.isFinite(num) ? num : null;
         };
@@ -779,10 +783,22 @@ module.exports = {
                         }
 
                         floodMonitor.recordTaskInit(userToken);
-                        
+
                         if (floodMonitor.isFlooding(userToken)){
                             die(`Uuh, slow down! It seems like you are sending a lot of tasks. Check that your connection is not dropping, or wait ${floodMonitor.FORGIVE_TIME} minutes and try again.`);
                             return;
+                        }
+
+                        // Settle the project name before a single image moves.
+                        // The worker checks again at dispatch, but by then the
+                        // operator has waited out a full upload and a VM boot
+                        // for an answer the bucket could have given up front.
+                        if (!params.reprocessProject){
+                            const project = sanitizeProjectName(params.taskName || "", "");
+                            if (await gcsProjects.exists(project)){
+                                die(`A project named "${project}" already exists in cloud storage. Choose a different name.`);
+                                return;
+                            }
                         }
 
                         // Save
@@ -794,6 +810,7 @@ module.exports = {
                                     ownerKey: userToken,
                                     actor,
                                     name: params.taskName,
+                                    reprocess: !!params.reprocessProject,
                                     status: jobHistory.STATUS.QUEUED
                                 });
 
@@ -1059,19 +1076,47 @@ module.exports = {
                             }
                         };
 
-                        // GCS-backed deployments can re-run from outputs/<project>/images/
-                        // when the gateway no longer holds the upload or a worker.
-                        const gcsReprocessAvailable = () => {
-                            const provider = asrProvider.get();
-                            const gcsConfig = provider && provider.getConfig && provider.getConfig("gcs");
-                            return !!(gcsConfig && gcsConfig.bucket &&
-                                      provider.getDriverName && provider.getDriverName() === "gce");
+                        /**
+                         * Frees the cloud project name a canceled job was
+                         * holding. A reachable worker does this itself when the
+                         * cancel arrives; this covers the case where the worker
+                         * is already gone but the images it uploaded are not.
+                         */
+                        const releaseGcsProject = async () => {
+                            const job = await jobHistory.lookup(taskId);
+                            if (!job || job.reprocess) return;
+
+                            const project = sanitizeProjectName(job.name || "", "");
+                            if (!project) return;
+
+                            const contenders = await jobHistory.activeWithProjectName(taskId, job.name);
+                            if (contenders.length){
+                                logger.event('task.project.release.skipped', {
+                                    taskId,
+                                    detail: `${project}: still in use by ${contenders[0].uuid}`
+                                });
+                                return;
+                            }
+
+                            const result = await gcsProjects.remove(project);
+                            if (result.removed){
+                                logger.event('task.project.released', {taskId, detail: project});
+                            }else if (result.error){
+                                logger.event('task.project.release.failed', {
+                                    taskId,
+                                    detail: `${project}: ${result.error}`,
+                                    level: 'warn'
+                                });
+                            }
                         };
 
                         const refuseRestart = async () => {
                             const job = await jobHistory.lookup(taskId);
                             const base = `Cannot restart task ${taskId}: its processing node is no longer available. Please create a new task.`;
-                            if (job && gcsReprocessAvailable()){
+                            // A GCS-backed deployment can re-run from
+                            // outputs/<project>/images/ when the gateway holds
+                            // neither the upload nor a worker.
+                            if (job && gcsProjects.enabled()){
                                 const project = sanitizeProjectName(job.name || "", taskId);
                                 if (project){
                                     json(res, {
@@ -1167,6 +1212,7 @@ module.exports = {
                                     }
 
                                     await recordAction();
+                                    if (pathname === '/task/cancel') await releaseGcsProject();
                                     json(res, { success: true });
                                 }else if (pathname === '/task/restart'){
                                     if (await restartFromLocalUpload()) return;
@@ -1195,6 +1241,7 @@ module.exports = {
                                     // Jobs predating the history ledger have no row to
                                     // update, but the client still needs to drop them.
                                     if (job) await recordAction();
+                                    if (job && pathname === '/task/cancel') await releaseGcsProject();
 
                                     json(res, { success: true });
                                 }
@@ -1244,6 +1291,9 @@ module.exports = {
                         // queryable field on the log entry.
                         clientMessage: clipField(report.message, 500),
                         endpoint: clipField(report.endpoint, 300),
+                        // window.onerror blames the document for anything thrown
+                        // from generated code, so endpoint alone can be a dead end.
+                        stack: clipField(report.stack, 1000),
                         phase: clipField(report.phase, 60),
                         status: numberField(report.status),
                         attempt: numberField(report.attempt),

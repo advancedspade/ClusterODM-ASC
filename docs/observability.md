@@ -52,7 +52,10 @@ the HTTP response finishing, so on a fast static dispatch it can land after
 | `task.commit.rejected` | Refused (deleted, canceled, over quota) |
 | `task.commit.responded` | Response finished. `outcome` is `responded` or `aborted` |
 | `task.dispatch.start` / `.node` | Hand-off begun; `.node` names the target (static and autoscale) |
-| `task.forward.retry` | Upload to the worker failed and is being retried |
+| `task.forward.retry` | Upload to the worker failed and is being retried. A worker that answers with a refusal is not retried |
+| `task.project.released` | Cancel deleted `outputs/<name>/`, freeing the project name |
+| `task.project.release.skipped` | Another unsettled job is working under the same name; the folder was left alone |
+| `task.project.release.failed` | The folder survived the cancel, so the name is still taken; `detail` says why |
 | `task.routed` | Worker owns the task; the gateway is now a proxy |
 | `task.queued` | No capacity; waiting for a node |
 | `task.dispatch.retained` | Persisted worker unreachable; claim held and re-probed rather than released |
@@ -106,6 +109,11 @@ Read it against the healthy sequence above. Where it stops tells you the phase:
   `task.machine.reaped` for the same task.
 - stops after `task.upload.batch` — the commit never arrived, so the browser
   lost the connection before sending it. Look for a matching `client.error`.
+- `task.failed` naming a project that already exists — the name check at
+  `/task/new/init` was skipped or could not reach the bucket, so the collision
+  surfaced only at dispatch. There should be no `task.forward.retry` in between:
+  a refusal is final. Repeated `task.forward.retry` carrying the same `detail`
+  means something is classifying a refusal as transient.
 - `task.commit.responded` with `outcome="aborted"` — the gateway did the work
   but the client never got the answer. This is the weekend incident: the retry
   logic now absorbs it and you should see a later `task.commit.duplicate`.
@@ -129,9 +137,13 @@ Read it against the healthy sequence above. Where it stops tells you the phase:
 ```bash
 gcloud logging read \
   "logName=\"projects/$P/logs/clusterodm\"
-   AND jsonPayload.metadata.event=~\"task\..*failed|task\.orphaned|client\.error\"" \
+   AND jsonPayload.metadata.event=~\"task\\.failed|task\\.orphaned|task\\.machine\\.reap\\.failed|node\\.destroy\\.failed\"" \
   --project="$P" --freshness=1h --format=json
 ```
+
+Browser `client.error` reports stay in the log (see below) but do not trip
+this alert. Cancel cleanup failures (`task.project.release.failed`) are also
+logged-only.
 
 ### Commits that the client never received
 
@@ -162,6 +174,13 @@ gcloud logging read \
 never reached the server, and `connection` carries the Network Information API
 hint when the browser exposes it. The browser's own error text is
 `clientMessage`, not `message`, because winston reserves the latter.
+
+For `source="window.onerror"`, read `stack` rather than `endpoint`. Anything
+thrown from generated code — a knockout binding expression, `eval` — is
+attributed to the document at line 1, so `endpoint` reads as `<host>/:1` no
+matter where it came from. A report with 12 identical entries five seconds apart
+is one page session hitting the per-page cap against a polling loop; the cadence
+names the timer, and `stack` names the line.
 
 ### Workers that stopped answering
 
@@ -233,9 +252,12 @@ default) and only after probing the worker first.
 
 helmut declares a log-based metric (`clusterodm/failure_events`) and an alert
 policy in each internal-tool project — see `monitoring.tf` in
-`live/{dev,prod}/internal-tool/`. It emails `alert_email` whenever a failure,
-orphan, or client error appears. Notification channels cannot be shared across
-projects, which is why each environment declares its own.
+`live/{dev,prod}/internal-tool/`. It emails `alert_email` when a task fails,
+is orphaned, or an autoscaled VM cannot be destroyed
+(`task.failed`, `task.orphaned`, `task.machine.reap.failed`,
+`node.destroy.failed`). Browser `client.error` reports remain queryable but
+do not page. Notification channels cannot be shared across projects, which is
+why each environment declares its own.
 
 To verify the pipeline end to end, force a failure on dev (upload with
 `--test_drop_uploads` on the reference node) and confirm both the log query and
