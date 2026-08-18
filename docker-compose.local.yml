@@ -32,3 +32,7 @@ services:
       - --admin-web-port
       - "0"
       - --no-splitmerge
+      # Lands in docker/data/ on the host; tail it to see every request the
+      # gateway receives (the structured event log only covers task lifecycle).
+      - --access-log
+      - data/access.log

@@ -108,6 +108,10 @@ See [docs/gcp.md](docs/gcp.md) and
 [docs/gcp-asr.example.json](docs/gcp-asr.example.json). Deploy to Helmut `dev`
 (`asc-internal-tools-dev`) before replicating IaC and secrets in production.
 
+[docs/observability.md](docs/observability.md) covers the structured Cloud
+Logging events, the queries for diagnosing a stuck upload, and how to recover a
+stranded one.
+
 ## Windows Bundle
 
 ClusterODM can run as a self-contained executable on Windows without the need for additional dependencies. You can download the latest `clusterodm-windows-x64.zip` bundle from the [releases](https://github.com/OpenDroneMap/ClusterODM/releases) page. Extract the contents in a folder and run:

@@ -28,6 +28,10 @@ const config = require('../config');
 // new VMs in the cloud to handle workloads when we run out of existing nodes
 let asrProvider = null;
 
+// taskId -> timeout handle for a delayed worker teardown. A restart inside the
+// cleanup window must cancel this, or the VM disappears under a revived job.
+const pendingCleanups = {};
+
 module.exports = {
     initialize: async function(userConfig){
         if (!userConfig) return;
@@ -79,12 +83,25 @@ module.exports = {
         if (asrProvider){
             const node = await routetable.lookupNode(taskId);
             if (node && node.isAutoSpawned()){
-                // Attempt to retrieve task info and save it in task table before deleting node
-                // so that users can continue to access this information.
+                // Snapshot everything the worker can still answer for. Once the
+                // VM is gone this table is the only place a client can read the
+                // task's final info and console output from.
                 try{
                     const route = await routetable.lookup(taskId);
                     if (route){
-                        await tasktable.add(taskId, {taskInfo: await node.taskInfo(taskId)}, route.token);
+                        const taskInfo = await node.taskInfo(taskId);
+                        // An unusable snapshot is worse than none: it would be
+                        // served in preference to the ledger for two days. Let
+                        // the ledger answer instead.
+                        if (taskInfo && !taskInfo.error && taskInfo.status){
+                            const output = await node.taskOutput(taskId);
+                            await tasktable.add(taskId, {
+                                taskInfo,
+                                output: Array.isArray(output) ? output : []
+                            }, route.token);
+                        }else{
+                            logger.warn(`Cannot add task table entry for ${taskId} from ${node}: ${(taskInfo && taskInfo.error) || 'no status reported'}`);
+                        }
                     }else{
                         logger.warn(`Cannot add task table entry for ${taskId} (route missing)`);
                     }
@@ -104,18 +121,33 @@ module.exports = {
     },
 
     cleanup: async function(taskId, delay = 0){
-        if (asrProvider){
+        if (this.get()){
             const node = await routetable.lookupNode(taskId);
             if (node && node.isAutoSpawned()){
+                // A second schedule for the same task replaces the first; the
+                // older timer would otherwise tear the node down on its own clock.
+                this.cancelCleanup(taskId);
+
                 const run = () => {
+                    delete pendingCleanups[taskId];
                     netutils.removeAndCleanupNode(node, this.get());
                 };
 
                 logger.debug(`ASR cleanup (in ${delay / 1000} seconds)`);
-                if (delay) setTimeout(run, delay);
+                if (delay) pendingCleanups[taskId] = setTimeout(run, delay);
                 else run();
             }
         }
+    },
+
+    // Returns true when a pending delayed teardown was canceled.
+    cancelCleanup: function(taskId){
+        const timer = pendingCleanups[taskId];
+        if (!timer) return false;
+        clearTimeout(timer);
+        delete pendingCleanups[taskId];
+        logger.debug(`ASR cleanup canceled for ${taskId}`);
+        return true;
     },
 
     vacuum: async function(){

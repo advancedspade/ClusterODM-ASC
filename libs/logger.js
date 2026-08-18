@@ -54,4 +54,53 @@ logger.add(new winston.transports.File({
         level: config.logger.level // Level of log messages
     }));
 
+// The Docker gcplogs driver ships stdout as an opaque textPayload, so JSON
+// printed to the console still arrives unqueryable. Writing to the Cloud
+// Logging API directly is what produces real jsonPayload fields, which is what
+// makes `jsonPayload.taskId="<uuid>"` filters work.
+if (process.env.GOOGLE_CLOUD_PROJECT){
+    try{
+        const {LoggingWinston} = require('@google-cloud/logging-winston');
+        logger.add(new LoggingWinston({
+            projectId: process.env.GOOGLE_CLOUD_PROJECT,
+            logName: process.env.GCP_LOG_NAME || 'clusterodm',
+            level: config.logger.level,
+            redirectToStdout: false,
+            // A failed log write must never take the gateway down with it.
+            defaultCallback: err => {
+                if (err) console.error(`Cloud Logging write failed: ${err.message}`);
+            }
+        }));
+    }catch(e){
+        console.error(`Cannot enable Cloud Logging transport: ${e.message}`);
+    }
+}
+
+/**
+ * Structured lifecycle event, so an incident can be reconstructed from a single
+ * taskId filter instead of substring-matching free text.
+ *
+ * logging-winston nests all winston metadata one level down, so `name` lands in
+ * `jsonPayload.metadata.event` and each field in `jsonPayload.metadata.<field>`.
+ * Query and alert on those paths, not `jsonPayload.<field>`.
+ *
+ * Avoid the keys winston consumes itself — `message`, `stack`, `splat` — as field
+ * names: winston folds them into the summary line and they never reach
+ * `metadata`. (`level` is the exception, read below to pick the severity.)
+ */
+logger.event = function(name, fields = {}){
+    const payload = Object.assign({}, fields, {event: name});
+    const level = payload.level || (/\.(failed|orphaned)$/.test(String(name)) ? 'warn' : 'info');
+    delete payload.level;
+
+    // Keeps the console/file transports readable. The Cloud Logging transport
+    // consumes the structured fields instead of this string.
+    const summary = Object.keys(payload)
+        .filter(k => k !== 'event' && payload[k] !== undefined && payload[k] !== null)
+        .map(k => `${k}=${typeof payload[k] === 'object' ? JSON.stringify(payload[k]) : payload[k]}`)
+        .join(' ');
+
+    logger.log(level, `${name}${summary ? ' ' + summary : ''}`, payload);
+};
+
 module.exports = logger;

@@ -90,6 +90,31 @@ status, actors, and events.
 - Removing or canceling a job whose worker is gone succeeds instead of failing
   with a routing error, and `GET /task/<uuid>/info` falls back to the ledger's
   last known outcome for any signed-in teammate.
+- Cancel deletes the gateway-held upload under `tmp/<uuid>/` and is final: the
+  UI does not offer Restart, and the gateway will not re-dispatch a canceled
+  uuid. A delayed autoscaler teardown scheduled by `/commit` is still canceled
+  if a non-canceled Restart lands while the worker is still reachable.
+- Cancel also deletes `outputs/<name>/`, so the project name is immediately
+  free to reuse. A reachable worker does this itself; the gateway covers the
+  case where the worker is already gone. Two guards keep it from destroying
+  work: a reprocess job never owned its folder and is skipped, and the node
+  refuses any project that already has an orthophoto.
+- Project names are checked against the bucket at `/task/new/init`, before a
+  single image moves. The check reads the bucket directly rather than the
+  5-minute list cache, because a name is taken the moment a worker uploads its
+  images and freed the moment a cancel deletes them — both in a different
+  process from the one answering. The worker still validates at dispatch as a
+  backstop, and a refusal there is now final instead of retried five times.
+- Only one dispatch may own an upload at a time. Cancel settles the job, and
+  settling clears the ledger's dispatch claim, so the claim alone cannot say
+  whether the dispatch it aborted is still booting a VM — an in-memory registry
+  answers that. Without it, a cancel/restart burst could start one worker per
+  click; Restart is no longer offered after cancel, and the registry still
+  protects any remaining restart paths (e.g. a swept orphan with files left).
+- A dispatch that ends without routing destroys the VM it created. Reconcile
+  also sweeps machine breadcrumbs left on **settled** jobs, which the orphan and
+  claim-recovery passes cannot see: reaching an outcome clears the dispatch
+  phase and drops the row out of the non-terminal listing they walk.
 - Reprocess sends `reprocessProject=true` through the gateway to the worker,
   allows reusing an existing folder name, and clears stale outputs (everything
   except `images/` and `gcp/`) only after the new run succeeds, right before
