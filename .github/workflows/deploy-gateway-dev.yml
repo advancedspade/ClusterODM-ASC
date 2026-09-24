@@ -11,6 +11,7 @@ name: Deploy ClusterODM Gateway (dev)
 # GitHub Environment: dev
 # Required secrets: SESSION_SECRET, OAUTH_GOOGLE_CLIENT_ID,
 #   OAUTH_GOOGLE_CLIENT_SECRET, REFERENCE_NODE_TOKEN, CLUSTERODM_ADMIN_PASSWORD
+# Optional secrets: MAPBOX_ACCESS_TOKEN (Leaflet basemap; URL-restrict in Mapbox)
 # Optional vars: GATEWAY_HOSTNAME, OAUTH_ALLOWED_DOMAINS
 # ASR config (deploy/clusterodm-gateway/gcp-asr.json) is committed — no HMAC.
 
@@ -117,6 +118,7 @@ jobs:
           OAUTH_ALLOWED_DOMAINS: ${{ vars.OAUTH_ALLOWED_DOMAINS }}
           REFERENCE_NODE_TOKEN: ${{ secrets.REFERENCE_NODE_TOKEN }}
           CLUSTERODM_ADMIN_PASSWORD: ${{ secrets.CLUSTERODM_ADMIN_PASSWORD }}
+          MAPBOX_ACCESS_TOKEN: ${{ secrets.MAPBOX_ACCESS_TOKEN }}
           SUPPORT_API_URL: ${{ vars.SUPPORT_API_URL }}
         run: |
           set -euo pipefail
@@ -127,6 +129,7 @@ jobs:
           # domain the gateway is served from. ClusterODM reads this env var
           # directly, so a wrong value passes login but 401s every proxied API.
           OAUTH_ALLOWED_DOMAINS="${OAUTH_ALLOWED_DOMAINS:-aspadeco.com}"
+          MAPBOX_ACCESS_TOKEN="${MAPBOX_ACCESS_TOKEN:-}"
 
           : "${SESSION_SECRET:?SESSION_SECRET is required}"
           : "${OAUTH_GOOGLE_CLIENT_ID:?OAUTH_GOOGLE_CLIENT_ID is required}"
@@ -165,6 +168,7 @@ jobs:
           GCS_PROJECT_ID=${GCS_PROJECT_ID}
           GCS_UPLOAD_PREFIX=${GCS_UPLOAD_PREFIX}
           SUPPORT_API_URL=${SUPPORT_API_URL}
+          MAPBOX_ACCESS_TOKEN=${MAPBOX_ACCESS_TOKEN}
           SESSION_SECRET=${SESSION_SECRET}
           REFERENCE_NODE_TOKEN=${REFERENCE_NODE_TOKEN}
           CLUSTERODM_ADMIN_PASSWORD=${CLUSTERODM_ADMIN_PASSWORD}
