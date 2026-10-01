@@ -164,6 +164,10 @@ module.exports = {
                          (val === 'true' || val === '1')){
                     params.reprocessProject = true;
                 }
+
+                else if (fieldname === 'expectedImages' && /^\d+$/.test(String(val))){
+                    params.expectedImages = parseInt(val, 10);
+                }
             });
         }
         if (options.saveFilesToDir){

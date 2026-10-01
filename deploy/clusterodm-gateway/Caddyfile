@@ -14,11 +14,9 @@
 			idle 10m
 		}
 
-		# Set GATEWAY_HTTP_PROTOCOLS="h1 h2" to stop advertising Alt-Svc so
-		# browsers fall back to TCP. QUIC plus multi-minute upload streams is an
-		# unproven but plausible contributor to dropped commits; measure on dev
-		# before touching prod.
-		protocols {$GATEWAY_HTTP_PROTOCOLS:h1 h2 h3}
+		# UDP 443 is closed on the gateway firewall, so an h3 advertisement only
+		# makes browsers try QUIC and time out before falling back to TCP.
+		protocols {$GATEWAY_HTTP_PROTOCOLS:h1 h2}
 	}
 }
 

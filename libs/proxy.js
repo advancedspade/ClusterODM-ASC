@@ -295,10 +295,14 @@ module.exports = {
                 }
 
                 const createdAt = (job && job.createdAt) || stats.mtime.getTime();
+                const imagesCount = files.filter(f => f.toLowerCase() !== 'body.json').length;
+                const expectedImages = Number(body.expectedImages) || 0;
                 pending.push({
                     uuid: entry,
                     name: (job && job.name) || body.taskName || null,
-                    imagesCount: files.filter(f => f.toLowerCase() !== 'body.json').length,
+                    imagesCount,
+                    expectedImages,
+                    partial: expectedImages > 0 && imagesCount < expectedImages,
                     createdAt,
                     ageMs: now - createdAt,
                     status: (job && job.status) || null
@@ -826,9 +830,6 @@ module.exports = {
                         });
                     });
                 }else if (req.method === 'POST' && pathname.indexOf('/task/new/upload') === 0){
-                    // Read the body in this turn. An idle socket timer used to
-                    // destroy() the request with no status line; Caddy then
-                    // answered 502 after however long the timer was.
                     const taskId = taskNew.getTaskIdFromPath(pathname);
                     if (!taskId){
                         json(res, { error: `No uuid found in ${pathname}`});
@@ -852,6 +853,35 @@ module.exports = {
                             return;
                         }
                     }
+                    // Chrome keeps a Pending row, and one of its 6 connections,
+                    // until this request fails. 30s of silence is a stall.
+                    // destroy() with no status line is a Caddy 502, so answer 408.
+                    const UPLOAD_IDLE_MS = 30000;
+                    let uploadReplied = false;
+                    const replyUpload = (body) => {
+                        if (uploadReplied || res.headersSent || res.writableEnded) return;
+                        uploadReplied = true;
+                        req.setTimeout(0);
+                        json(res, body);
+                    };
+                    req.setTimeout(UPLOAD_IDLE_MS, () => {
+                        if (uploadReplied || res.headersSent || res.writableEnded) return;
+                        uploadReplied = true;
+                        logger.event('task.upload.stalled', {
+                            taskId,
+                            actor: actor && actor.email,
+                            detail: 'idle 30s',
+                            level: 'warn'
+                        });
+                        try{
+                            res.writeHead(408, {"Content-Type": "application/json"});
+                            res.end(JSON.stringify({error: "Upload stalled before the file was saved."}), () => {
+                                req.destroy();
+                            });
+                        }catch(e){
+                            req.destroy();
+                        }
+                    });
                     taskNew.formDataParser(req, function(params){
                         if (!params.imagesCount){
                             logger.event('task.upload.batch', {
@@ -860,7 +890,7 @@ module.exports = {
                                 detail: params.error || "No files uploaded.",
                                 level: 'warn'
                             });
-                            json(res, {error: params.error || "No files uploaded."});
+                            replyUpload({error: params.error || "No files uploaded."});
                         }else if (params.error){
                             logger.event('task.upload.batch', {
                                 taskId,
@@ -868,7 +898,7 @@ module.exports = {
                                 detail: params.error,
                                 level: 'warn'
                             });
-                            json(res, {error: params.error});
+                            replyUpload({error: params.error});
                         }else{
                             logger.event('task.upload.batch', {
                                 taskId,
@@ -876,7 +906,7 @@ module.exports = {
                                 batchCount: params.imagesCount,
                                 level: 'debug'
                             });
-                            json(res, {success: true});
+                            replyUpload({success: true});
                         }
                     }, { saveFilesToDir, parseFields: false});
                 }else if (req.method === 'POST' && pathname.indexOf('/task/new/commit') === 0){
