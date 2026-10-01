@@ -3,3 +3,5 @@ package-lock.json
 *.log
 .env
 deploy/clusterodm-gateway/.env
+.tmp-node/
+.tmp-npm/

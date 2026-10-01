@@ -11,6 +11,7 @@ name: Deploy ClusterODM Gateway (dev)
 # GitHub Environment: dev
 # Required secrets: SESSION_SECRET, OAUTH_GOOGLE_CLIENT_ID,
 #   OAUTH_GOOGLE_CLIENT_SECRET, REFERENCE_NODE_TOKEN, CLUSTERODM_ADMIN_PASSWORD
+# Optional secrets: MAPBOX_ACCESS_TOKEN (Leaflet basemap; URL-restrict in Mapbox)
 # Optional vars: GATEWAY_HOSTNAME, OAUTH_ALLOWED_DOMAINS
 # ASR config (deploy/clusterodm-gateway/gcp-asr.json) is committed — no HMAC.
 
@@ -33,6 +34,8 @@ env:
   WIF_PROVIDER: projects/809964514017/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
   SA_EMAIL: clusterodm-deployer@asc-internal-tools-dev.iam.gserviceaccount.com
   GATEWAY_HOSTNAME_DEFAULT: dev.dronez.advancedspadecompany.com
+  CAD_ORTHO_EXPORT_REGION: us-central1
+  CAD_ORTHO_EXPORT_JOB_NAME: cad-ortho-export
 
 permissions:
   contents: read
@@ -117,6 +120,7 @@ jobs:
           OAUTH_ALLOWED_DOMAINS: ${{ vars.OAUTH_ALLOWED_DOMAINS }}
           REFERENCE_NODE_TOKEN: ${{ secrets.REFERENCE_NODE_TOKEN }}
           CLUSTERODM_ADMIN_PASSWORD: ${{ secrets.CLUSTERODM_ADMIN_PASSWORD }}
+          MAPBOX_ACCESS_TOKEN: ${{ secrets.MAPBOX_ACCESS_TOKEN }}
           SUPPORT_API_URL: ${{ vars.SUPPORT_API_URL }}
         run: |
           set -euo pipefail
@@ -127,6 +131,7 @@ jobs:
           # domain the gateway is served from. ClusterODM reads this env var
           # directly, so a wrong value passes login but 401s every proxied API.
           OAUTH_ALLOWED_DOMAINS="${OAUTH_ALLOWED_DOMAINS:-aspadeco.com}"
+          MAPBOX_ACCESS_TOKEN="${MAPBOX_ACCESS_TOKEN:-}"
 
           : "${SESSION_SECRET:?SESSION_SECRET is required}"
           : "${OAUTH_GOOGLE_CLIENT_ID:?OAUTH_GOOGLE_CLIENT_ID is required}"
@@ -152,6 +157,7 @@ jobs:
 
           NODEODM_IMAGE="${AR_LOCATION}-docker.pkg.dev/${AR_PROJECT_ID}/${AR_REPOSITORY}/${NODEODM_IMAGE_NAME}:${IMAGE_TAG}"
           CLUSTERODM_IMAGE="${AR_LOCATION}-docker.pkg.dev/${AR_PROJECT_ID}/${AR_REPOSITORY}/${CLUSTERODM_IMAGE_NAME}:${IMAGE_TAG}"
+          CAD_ORTHO_EXPORT_JOB="projects/${GCP_PROJECT_ID}/locations/${CAD_ORTHO_EXPORT_REGION}/jobs/${CAD_ORTHO_EXPORT_JOB_NAME}"
 
           # GATEWAY_INTERNAL_IP is filled on the VM by remote-deploy.sh
           cat > .env <<EOF
@@ -164,7 +170,9 @@ jobs:
           GCS_BUCKET=${GCS_BUCKET}
           GCS_PROJECT_ID=${GCS_PROJECT_ID}
           GCS_UPLOAD_PREFIX=${GCS_UPLOAD_PREFIX}
+          CAD_ORTHO_EXPORT_JOB=${CAD_ORTHO_EXPORT_JOB}
           SUPPORT_API_URL=${SUPPORT_API_URL}
+          MAPBOX_ACCESS_TOKEN=${MAPBOX_ACCESS_TOKEN}
           SESSION_SECRET=${SESSION_SECRET}
           REFERENCE_NODE_TOKEN=${REFERENCE_NODE_TOKEN}
           CLUSTERODM_ADMIN_PASSWORD=${CLUSTERODM_ADMIN_PASSWORD}

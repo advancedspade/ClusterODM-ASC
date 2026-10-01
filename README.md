@@ -8,7 +8,7 @@ The program has been battle tested on [WebODM Lightning](https://webodm.net) for
 
 ## Installation
 
-The only requirement is a working installation of [NodeJS](https://nodejs.org) 14 or earlier (ClusterODM has compatibility issues with NodeJS 16 and later).
+The only requirement is a working installation of [NodeJS](https://nodejs.org) 20 LTS. The Docker image is built from `node:20-bookworm` (includes a Node-20-compatible `node-libcurl` binding for multipart uploads).
 
 ```bash
 git clone https://github.com/OpenDroneMap/ClusterODM

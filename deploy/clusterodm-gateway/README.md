@@ -61,6 +61,9 @@ Required secrets: `SESSION_SECRET`, `OAUTH_GOOGLE_CLIENT_ID`,
 `OAUTH_GOOGLE_CLIENT_SECRET`, `REFERENCE_NODE_TOKEN`,
 `CLUSTERODM_ADMIN_PASSWORD`. Do **not** share `SESSION_SECRET` across envs.
 
+Optional secrets: `MAPBOX_ACCESS_TOKEN` (public Mapbox token for the portal
+Leaflet basemap / orthophoto preview; URL-restrict in Mapbox).
+
 Optional vars: `GATEWAY_HOSTNAME`, `OAUTH_ALLOWED_DOMAINS`.
 
 ASR config is committed (ADC only — no HMAC). Prod workflow copies

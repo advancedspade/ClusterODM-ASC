@@ -1,4 +1,4 @@
-FROM node:14-bullseye
+FROM node:20-bookworm
 LABEL maintainer="Piero Toffanin <pt@masseranolabs.com>"
 
 EXPOSE 3000
