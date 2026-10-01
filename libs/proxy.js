@@ -826,69 +826,59 @@ module.exports = {
                         });
                     });
                 }else if (req.method === 'POST' && pathname.indexOf('/task/new/upload') === 0){
-                    // Inactivity timer. Once the body is buffered, the socket is quiet
-                    // while the directory checks below run; destroy() writes no status
-                    // and Caddy returns 502. 10m matches the gateway idle timeout.
-                    req.setTimeout(10 * 60 * 1000, () => {
-                        req.destroy();
-                    });
-
+                    // Read the body in this turn. An idle socket timer used to
+                    // destroy() the request with no status line; Caddy then
+                    // answered 502 after however long the timer was.
                     const taskId = taskNew.getTaskIdFromPath(pathname);
-                    if (taskId){
-                        const saveFilesToDir = path.join('tmp', taskId);
-                        async.series([
-                            cb => {
-                                fs.exists(saveFilesToDir, exists => {
-                                    if (!exists) cb(new Error("Invalid taskId: the task no longer exists."));
-                                    else cb();
-                                });
-                            },
-                            cb => {
-                                if (limits && limits.maxImages){
-                                    // Check if we've exceeding image limits
-                                    fs.readdir(saveFilesToDir, (err, files) => {
-                                        if (err){
-                                            logger.warn(`Failed to read files from ${saveFilesToDir}`);
-                                            cb();
-                                        }else if (files.length - 1 > limits.maxImages){
-                                            // -1 accounts for _body.json
-                                            cb(new Error("Max images count exceeded."));
-                                        }else{
-                                            cb();
-                                        }
-                                    });
-                                }else{
-                                    // No limits
-                                    cb();
-                                }
-                            },
-                            cb => {
-                                taskNew.formDataParser(req, function(params){
-                                    if (!params.imagesCount) cb(new Error("No files uploaded."));
-                                    else if (params.error) cb(new Error(params.error));
-                                    else cb(null, params.imagesCount);
-                                }, { saveFilesToDir, parseFields: false});
-                            }
-                        ], (err, results) => {
-                            if (err){
-                                logger.event('task.upload.batch', {
-                                    taskId,
-                                    actor: actor && actor.email,
-                                    detail: err.message,
-                                    level: 'warn'
-                                });
-                                json(res, {error: err.message});
-                            }else{
-                                logger.event('task.upload.batch', {
-                                    taskId,
-                                    actor: actor && actor.email,
-                                    batchCount: results[results.length - 1] || 0,
-                                    level: 'debug'
-                                });
-                                json(res, {success: true});
-                            }
-                        });
-                    }else json(res, { error: `No uuid found in ${pathname}`});
+                    if (!taskId){
+                        json(res, { error: `No uuid found in ${pathname}`});
+                        return;
+                    }
+                    const saveFilesToDir = path.join('tmp', taskId);
+                    if (!fs.existsSync(saveFilesToDir)){
+                        json(res, {error: "Invalid taskId: the task no longer exists."});
+                        return;
+                    }
+                    if (limits && limits.maxImages){
+                        let files = [];
+                        try{
+                            files = fs.readdirSync(saveFilesToDir);
+                        }catch(err){
+                            logger.warn(`Failed to read files from ${saveFilesToDir}: ${err.message}`);
+                        }
+                        // -1 accounts for _body.json
+                        if (files.length - 1 > limits.maxImages){
+                            json(res, {error: "Max images count exceeded."});
+                            return;
+                        }
+                    }
+                    taskNew.formDataParser(req, function(params){
+                        if (!params.imagesCount){
+                            logger.event('task.upload.batch', {
+                                taskId,
+                                actor: actor && actor.email,
+                                detail: params.error || "No files uploaded.",
+                                level: 'warn'
+                            });
+                            json(res, {error: params.error || "No files uploaded."});
+                        }else if (params.error){
+                            logger.event('task.upload.batch', {
+                                taskId,
+                                actor: actor && actor.email,
+                                detail: params.error,
+                                level: 'warn'
+                            });
+                            json(res, {error: params.error});
+                        }else{
+                            logger.event('task.upload.batch', {
+                                taskId,
+                                actor: actor && actor.email,
+                                batchCount: params.imagesCount,
+                                level: 'debug'
+                            });
+                            json(res, {success: true});
+                        }
+                    }, { saveFilesToDir, parseFields: false});
                 }else if (req.method === 'POST' && pathname.indexOf('/task/new/commit') === 0){
                     const taskId = taskNew.getTaskIdFromPath(pathname);
                     if (taskId) await commitTask({ req, res, taskId, userToken, actor, limits });
@@ -1471,17 +1461,24 @@ module.exports = {
             }
         };
 
+        // Default requestTimeout is 5 minutes and closes the socket while a
+        // body is still arriving. One image on a slow link outlives that.
+        const openServer = (server) => {
+            server.requestTimeout = 0;
+            return server;
+        };
+
         const servers = [{
-            server: http.createServer(requestListener),
+            server: openServer(http.createServer(requestListener)),
             secure: false
         }];
 
         if (config.use_ssl){
             servers.push({
-                server: https.createServer({
+                server: openServer(https.createServer({
                     key: fs.readFileSync(config.ssl_key, 'utf8'),
                     cert: fs.readFileSync(config.ssl_cert, 'utf8')
-                }, requestListener),
+                }, requestListener)),
                 secure: true
             });
         }
