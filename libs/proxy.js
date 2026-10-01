@@ -826,8 +826,10 @@ module.exports = {
                         });
                     });
                 }else if (req.method === 'POST' && pathname.indexOf('/task/new/upload') === 0){
-                    // Destroy sockets after 30s of inactivity
-                    req.setTimeout(30000, () => {
+                    // Inactivity timer. Once the body is buffered, the socket is quiet
+                    // while the directory checks below run; destroy() writes no status
+                    // and Caddy returns 502. 10m matches the gateway idle timeout.
+                    req.setTimeout(10 * 60 * 1000, () => {
                         req.destroy();
                     });
 
