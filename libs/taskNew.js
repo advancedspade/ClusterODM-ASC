@@ -15,11 +15,12 @@
  *  You should have received a copy of the GNU Affero General Public License
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-const Busboy = require('busboy');
+const busboy = require('busboy');
 const utils = require('./utils');
 const netutils = require('./netutils');
 const path = require('path');
 const fs = require('fs');
+const { Transform } = require('stream');
 const config = require('../config');
 const Curl = require('node-libcurl').Curl;
 const tasktable = require('./tasktable');
@@ -113,8 +114,16 @@ module.exports = {
         if (options.saveFilesToDir === undefined) options.saveFilesToDir = false;
         if (options.parseFields === undefined) options.parseFields = true;
         if (options.limits === undefined) options.limits = {};
-        
-        const busboy = new Busboy({ headers: req.headers });
+
+        const parser = busboy({ headers: req.headers });
+
+        const stages = options.stages || {
+            bytes: 0,
+            reqEnd: false,
+            fileEnd: false,
+            writeFinish: false,
+            parserFinish: false
+        };
 
         const params = {
             options: null,
@@ -126,11 +135,20 @@ module.exports = {
             webhook: "",
             reprocessProject: false,
             fileNames: [],
-            imagesCount: 0
+            imagesCount: 0,
+            stages
         };
 
+        req.on('end', () => { stages.reqEnd = true; });
+        const byteCounter = new Transform({
+            transform(chunk, enc, cb){
+                stages.bytes += chunk.length;
+                cb(null, chunk);
+            }
+        });
+
         if (options.parseFields){
-            busboy.on('field', function(fieldname, val, fieldnameTruncated, valTruncated) {
+            parser.on('field', function(fieldname, val) {
                 // Save options
                 if (fieldname === 'options'){
                     params.options = val;
@@ -171,7 +189,8 @@ module.exports = {
             });
         }
         if (options.saveFilesToDir){
-            busboy.on('file', function(fieldname, file, filename, encoding, mimetype) {
+            parser.on('file', function(fieldname, file, info) {
+                const filenameIn = info && info.filename;
                 if (fieldname !== 'images'){
                     file.resume();
                     return;
@@ -182,7 +201,7 @@ module.exports = {
                     return;
                 }
 
-                filename = utils.sanitize(filename);
+                let filename = utils.sanitize(filenameIn || "");
 
                 // Special case
                 if (filename === 'body.json') filename = '_body.json';
@@ -195,9 +214,11 @@ module.exports = {
                 const saveTo = path.join(options.saveFilesToDir, name);
                 let saveStream = null;
 
-                // Detect if a connection is aborted/interrupted
-                // and cleanup any open streams to avoid fd leaks
+                // 'close' also fires once the request body has been fully read.
+                // Only a disconnect before that is an abort; tearing the write
+                // down on a completed body stops the parser from ever answering.
                 const handleClose = () => {
+                    if (req.complete && !req.aborted) return;
                     if (saveStream){
                         saveStream.close();
                         saveStream = null;
@@ -214,6 +235,7 @@ module.exports = {
                 req.on('abort', handleClose);
 
                 file.on('end', () => {
+                    stages.fileEnd = true;
                     req.removeListener('close', handleClose);
                     req.removeListener('abort', handleClose);
                     saveStream = null;
@@ -224,6 +246,7 @@ module.exports = {
                 });
 
                 saveStream = fs.createWriteStream(saveTo);
+                saveStream.on('finish', () => { stages.writeFinish = true; });
                 saveStream.on('error', (err) => {
                     params.error = err.message;
                     logger.error(err);
@@ -232,10 +255,20 @@ module.exports = {
                 file.pipe(saveStream);
             });
         }
-        busboy.on('finish', function(){
+        let parserDone = false;
+        const parserFinished = () => {
+            if (parserDone) return;
+            parserDone = true;
+            stages.parserFinish = true;
             onFinish(params);
+        };
+        parser.on('close', parserFinished);
+        parser.on('finish', parserFinished);
+        parser.on('error', (err) => {
+            params.error = err.message;
+            parserFinished();
         });
-        req.pipe(busboy);
+        req.pipe(byteCounter).pipe(parser);
     },
 
     getTaskIdFromPath: function(pathname){
