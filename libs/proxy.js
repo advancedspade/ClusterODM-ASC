@@ -21,8 +21,9 @@ const http = require('http');
 const https = require('https');
 const path = require('path');
 const url = require('url');
-const Busboy = require('busboy');
+const busboy = require('busboy');
 const fs = require('fs');
+const { Transform } = require('stream');
 const nodes = require('./nodes');
 const ValueCache = require('./classes/ValueCache');
 const config = require('../config');
@@ -252,6 +253,180 @@ module.exports = {
             req.url = url.format({ query, pathname });
         };
 
+        const UPLOAD_IDLE_MS = 30000;
+
+        const stageFields = (stages) => ({
+            stageBytes: stages ? stages.bytes : 0,
+            stageReqEnd: !!(stages && stages.reqEnd),
+            stageFileEnd: !!(stages && stages.fileEnd),
+            stageWriteFinish: !!(stages && stages.writeFinish),
+            stageParserFinish: !!(stages && stages.parserFinish)
+        });
+
+        const cleanUploadName = (raw) => {
+            let name;
+            try{
+                name = decodeURIComponent(String(raw));
+            }catch(e){
+                return null;
+            }
+            name = path.basename(utils.sanitize(name));
+            if (!name || name === "." || name === "..") return null;
+            if (name.toLowerCase() === "body.json" || name.startsWith(".")) return null;
+            if (name.indexOf("\0") !== -1) return null;
+            return name;
+        };
+
+        const replyStatus = (res, statusCode, body) => {
+            if (res.headersSent || res.writableEnded) return false;
+            res.writeHead(statusCode, {"Content-Type": "application/json"});
+            res.end(JSON.stringify(body));
+            return true;
+        };
+
+        // A quiet socket stays Pending in the browser until something answers.
+        // destroy() with no status line is a Caddy 502, so answer 408.
+        const armUploadIdle = (req, res, taskId, actor, stages) => {
+            let replied = false;
+            const finish = (statusCode, body) => {
+                if (replied || res.headersSent || res.writableEnded) return false;
+                replied = true;
+                req.setTimeout(0);
+                if (statusCode === 200) json(res, body);
+                else replyStatus(res, statusCode, body);
+                return true;
+            };
+            req.setTimeout(UPLOAD_IDLE_MS, () => {
+                if (replied || res.headersSent || res.writableEnded) return;
+                replied = true;
+                logger.event('task.upload.stalled', Object.assign({
+                    taskId,
+                    actor: actor && actor.email,
+                    detail: 'idle 30s',
+                    level: 'warn'
+                }, stageFields(stages)));
+                try{
+                    res.writeHead(408, {"Content-Type": "application/json"});
+                    res.end(JSON.stringify({error: "Upload stalled before the file was saved."}), () => {
+                        req.destroy();
+                    });
+                }catch(e){
+                    req.destroy();
+                }
+            });
+            return { finish, replied: () => replied };
+        };
+
+        const handleRawUpload = (req, res, taskId, filename, limits, actor) => {
+            const saveFilesToDir = path.join('tmp', taskId);
+            if (!fs.existsSync(saveFilesToDir)){
+                json(res, {error: "Invalid taskId: the task no longer exists."});
+                return;
+            }
+            const contentLength = parseInt(req.headers['content-length'], 10);
+            if (!Number.isFinite(contentLength) || contentLength <= 0){
+                replyStatus(res, 400, {error: "Content-Length is required."});
+                return;
+            }
+
+            let existing = [];
+            try{
+                existing = utils.imageFiles(fs.readdirSync(saveFilesToDir));
+            }catch(err){
+                logger.warn(`Failed to read files from ${saveFilesToDir}: ${err.message}`);
+            }
+            const replacing = existing.indexOf(filename) !== -1;
+            if (limits && limits.maxImages && !replacing && existing.length >= limits.maxImages){
+                json(res, {error: "Max images count exceeded."});
+                return;
+            }
+
+            const stages = { bytes: 0, reqEnd: false, fileEnd: false, writeFinish: false, parserFinish: true };
+            const idle = armUploadIdle(req, res, taskId, actor, stages);
+            const partPath = path.join(saveFilesToDir, `.${filename}.part`);
+            const finalPath = path.join(saveFilesToDir, filename);
+            let written = 0;
+            let settled = false;
+            const out = fs.createWriteStream(partPath);
+            const counter = new Transform({
+                transform(chunk, enc, cb){
+                    written += chunk.length;
+                    stages.bytes += chunk.length;
+                    cb(null, chunk);
+                }
+            });
+
+            const discardPart = () => {
+                fs.unlink(partPath, () => {});
+            };
+
+            req.on('end', () => { stages.reqEnd = true; stages.fileEnd = true; });
+            req.on('aborted', () => {
+                if (settled) return;
+                settled = true;
+                out.destroy();
+                discardPart();
+                idle.finish(400, {error: `Upload interrupted for ${filename}: received ${written} of ${contentLength} bytes.`});
+            });
+
+            out.on('error', (err) => {
+                if (settled) return;
+                settled = true;
+                logger.error(err);
+                discardPart();
+                idle.finish(500, {error: err.message});
+            });
+            out.on('finish', () => {
+                stages.writeFinish = true;
+                if (settled || idle.replied()) {
+                    discardPart();
+                    return;
+                }
+                if (written !== contentLength){
+                    settled = true;
+                    discardPart();
+                    idle.finish(400, {error: `Upload size mismatch for ${filename}: received ${written} of ${contentLength} bytes.`});
+                    return;
+                }
+                fs.rename(partPath, finalPath, (err) => {
+                    if (settled) return;
+                    settled = true;
+                    if (err){
+                        discardPart();
+                        idle.finish(500, {error: err.message});
+                        return;
+                    }
+                    logger.event('task.upload.batch', Object.assign({
+                        taskId,
+                        actor: actor && actor.email,
+                        batchCount: 1,
+                        name: filename,
+                        level: 'debug'
+                    }, stageFields(stages)));
+                    idle.finish(200, {success: true, name: filename, size: written});
+                });
+            });
+
+            req.pipe(counter).pipe(out);
+        };
+
+        const listUploadFiles = async (taskId) => {
+            const saveFilesToDir = path.join('tmp', taskId);
+            const names = utils.imageFiles(await fs.promises.readdir(saveFilesToDir));
+            const files = [];
+            for (const name of names){
+                const stats = await fs.promises.stat(path.join(saveFilesToDir, name));
+                if (!stats.isFile()) continue;
+                files.push({ name, size: stats.size });
+            }
+            let expectedImages = 0;
+            try{
+                const body = JSON.parse(await fs.promises.readFile(path.join(saveFilesToDir, 'body.json'), 'utf8'));
+                expectedImages = Number(body.expectedImages) || 0;
+            }catch(e){}
+            return { files, expectedImages };
+        };
+
         // Uploads that finished but were never handed to a worker. This is what
         // makes a commit lost to a dropped connection visible and resumable
         // instead of invisible until the retention window deletes it.
@@ -295,7 +470,7 @@ module.exports = {
                 }
 
                 const createdAt = (job && job.createdAt) || stats.mtime.getTime();
-                const imagesCount = files.filter(f => f.toLowerCase() !== 'body.json').length;
+                const imagesCount = utils.imageFiles(files).length;
                 const expectedImages = Number(body.expectedImages) || 0;
                 pending.push({
                     uuid: entry,
@@ -317,7 +492,7 @@ module.exports = {
          * the response can POST the same commit again and gets the original uuid
          * back rather than starting a second run.
          */
-        const commitTask = async ({ req, res, taskId, userToken, actor, limits, restart = false }) => {
+        const commitTask = async ({ req, res, taskId, userToken, actor, limits, restart = false, allowPartial = false }) => {
             const tmpPath = path.join('tmp', taskId);
             const bodyFile = path.join(tmpPath, 'body.json');
             const actorEmail = actor && actor.email;
@@ -404,10 +579,21 @@ module.exports = {
             let body, files;
             try{
                 body = JSON.parse(await fs.promises.readFile(bodyFile, 'utf8'));
-                files = (await fs.promises.readdir(tmpPath)).filter(f => f.toLowerCase() !== 'body.json');
+                files = utils.imageFiles(await fs.promises.readdir(tmpPath));
             }catch(e){
                 logger.event('task.commit.rejected', {taskId, actor: actorEmail, detail: e.message});
                 json(res, {error: `Cannot commit task: ${e.message}`});
+                return;
+            }
+
+            const expectedImages = Number(body.expectedImages) || 0;
+            if (expectedImages > 0 && files.length < expectedImages && !allowPartial){
+                logger.event('task.commit.rejected', {
+                    taskId,
+                    actor: actorEmail,
+                    detail: `${files.length} of ${expectedImages} files uploaded`
+                });
+                json(res, {error: `${files.length} of ${expectedImages} files uploaded`});
                 return;
             }
 
@@ -829,10 +1015,32 @@ module.exports = {
                             }
                         });
                     });
-                }else if (req.method === 'POST' && pathname.indexOf('/task/new/upload') === 0){
+                }else if (pathname.indexOf('/task/new/upload/') === 0){
+                    const rawMatch = pathname.match(/^\/task\/new\/upload\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/(.+)$/i);
+                    if (req.method === 'PUT' && rawMatch && utils.isTaskUuid(rawMatch[1])){
+                        const filename = cleanUploadName(rawMatch[2]);
+                        if (!filename){
+                            replyStatus(res, 400, {error: "Invalid upload filename."});
+                            return;
+                        }
+                        handleRawUpload(req, res, rawMatch[1], filename, limits, actor);
+                        return;
+                    }
                     const taskId = taskNew.getTaskIdFromPath(pathname);
                     if (!taskId){
                         json(res, { error: `No uuid found in ${pathname}`});
+                        return;
+                    }
+                    if (req.method === 'GET'){
+                        try{
+                            json(res, await listUploadFiles(taskId));
+                        }catch(e){
+                            json(res, {error: "Invalid taskId: the task no longer exists."});
+                        }
+                        return;
+                    }
+                    if (req.method !== 'POST'){
+                        json(res, {error: `Cannot handle ${pathname}`});
                         return;
                     }
                     const saveFilesToDir = path.join('tmp', taskId);
@@ -843,75 +1051,49 @@ module.exports = {
                     if (limits && limits.maxImages){
                         let files = [];
                         try{
-                            files = fs.readdirSync(saveFilesToDir);
+                            files = utils.imageFiles(fs.readdirSync(saveFilesToDir));
                         }catch(err){
                             logger.warn(`Failed to read files from ${saveFilesToDir}: ${err.message}`);
                         }
-                        // -1 accounts for _body.json
-                        if (files.length - 1 > limits.maxImages){
+                        if (files.length > limits.maxImages){
                             json(res, {error: "Max images count exceeded."});
                             return;
                         }
                     }
-                    // Chrome keeps a Pending row, and one of its 6 connections,
-                    // until this request fails. 30s of silence is a stall.
-                    // destroy() with no status line is a Caddy 502, so answer 408.
-                    const UPLOAD_IDLE_MS = 30000;
-                    let uploadReplied = false;
-                    const replyUpload = (body) => {
-                        if (uploadReplied || res.headersSent || res.writableEnded) return;
-                        uploadReplied = true;
-                        req.setTimeout(0);
-                        json(res, body);
-                    };
-                    req.setTimeout(UPLOAD_IDLE_MS, () => {
-                        if (uploadReplied || res.headersSent || res.writableEnded) return;
-                        uploadReplied = true;
-                        logger.event('task.upload.stalled', {
-                            taskId,
-                            actor: actor && actor.email,
-                            detail: 'idle 30s',
-                            level: 'warn'
-                        });
-                        try{
-                            res.writeHead(408, {"Content-Type": "application/json"});
-                            res.end(JSON.stringify({error: "Upload stalled before the file was saved."}), () => {
-                                req.destroy();
-                            });
-                        }catch(e){
-                            req.destroy();
-                        }
-                    });
+                    const stages = { bytes: 0, reqEnd: false, fileEnd: false, writeFinish: false, parserFinish: false };
+                    const idle = armUploadIdle(req, res, taskId, actor, stages);
                     taskNew.formDataParser(req, function(params){
+                        const fields = stageFields(params.stages || stages);
                         if (!params.imagesCount){
-                            logger.event('task.upload.batch', {
+                            logger.event('task.upload.batch', Object.assign({
                                 taskId,
                                 actor: actor && actor.email,
                                 detail: params.error || "No files uploaded.",
                                 level: 'warn'
-                            });
-                            replyUpload({error: params.error || "No files uploaded."});
+                            }, fields));
+                            idle.finish(200, {error: params.error || "No files uploaded."});
                         }else if (params.error){
-                            logger.event('task.upload.batch', {
+                            logger.event('task.upload.batch', Object.assign({
                                 taskId,
                                 actor: actor && actor.email,
                                 detail: params.error,
                                 level: 'warn'
-                            });
-                            replyUpload({error: params.error});
+                            }, fields));
+                            idle.finish(200, {error: params.error});
                         }else{
-                            logger.event('task.upload.batch', {
+                            logger.event('task.upload.batch', Object.assign({
                                 taskId,
                                 actor: actor && actor.email,
                                 batchCount: params.imagesCount,
                                 level: 'debug'
-                            });
-                            replyUpload({success: true});
+                            }, fields));
+                            idle.finish(200, {success: true});
                         }
-                    }, { saveFilesToDir, parseFields: false});
+                    }, { saveFilesToDir, parseFields: false, stages });
                 }else if (req.method === 'POST' && pathname.indexOf('/task/new/commit') === 0){
                     const taskId = taskNew.getTaskIdFromPath(pathname);
-                    if (taskId) await commitTask({ req, res, taskId, userToken, actor, limits });
+                    const allowPartial = query.allowPartial === 'true' || query.allowPartial === '1';
+                    if (taskId) await commitTask({ req, res, taskId, userToken, actor, limits, allowPartial });
                     else json(res, { error: `No uuid found in ${pathname}`});
                 }else if (req.method === 'POST' && pathname === '/task/new') {
                     // Absorb set-uuid retries before createContext: getUuid() would
@@ -1057,13 +1239,16 @@ module.exports = {
                     let taskId = null;
                     let body = await getReqBody(req);
 
-                    const busboy = new Busboy({ headers: req.headers });
-                    busboy.on('field', function(fieldname, val, fieldnameTruncated, valTruncated) {
+                    const form = busboy({ headers: req.headers });
+                    form.on('field', function(fieldname, val) {
                         if (fieldname === 'uuid'){
                             taskId = val;
                         }
                     });
-                    busboy.on('finish', async function() {
+                    let formDone = false;
+                    form.on('close', async function() {
+                        if (formDone) return;
+                        formDone = true;
                         if (!taskId){
                             json(res, { error: `No uuid found in ${pathname}`});
                             return;
@@ -1274,7 +1459,7 @@ module.exports = {
                         }
                     });
 
-                    utils.stringToStream(body).pipe(busboy);
+                    utils.stringToStream(body).pipe(form);
                 }else if (req.method === 'POST' && ['/project/archive', '/project/restore'].indexOf(pathname) !== -1){
                     const body = querystring.parse(await getReqBody(req));
                     const requestedName = String(body.name || "").trim();

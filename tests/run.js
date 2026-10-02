@@ -1599,6 +1599,251 @@ async function testMachineBreadcrumbIsNameScoped(){
     }
 }
 
+async function testRawAndMultipartUploads(){
+    try{
+        require("node-libcurl");
+    }catch(e){
+        if (String(e.message).indexOf("node_libcurl.node") === -1) throw e;
+        const Module = require("module");
+        const originalRequire = Module.prototype.require;
+        Module.prototype.require = function(id){
+            if (id === "node-libcurl") return { Curl: function Curl(){} };
+            return originalRequire.apply(this, arguments);
+        };
+    }
+    const proxy = require("../libs/proxy");
+    const floodMonitor = require("../libs/floodMonitor");
+    const LocalCloudProvider = require("../libs/cloud-providers/LocalCloudProvider");
+
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "clusterodm-upload-"));
+    fs.mkdirSync(path.join(workDir, "data"));
+    fs.mkdirSync(path.join(workDir, "tmp"));
+
+    const originalCwd = process.cwd();
+    const originalToken = config.token;
+    config.token = "";
+    process.chdir(workDir);
+
+    const taskId = "12121212-1212-4121-8121-121212121212";
+    let server = null;
+    try{
+        floodMonitor.initialize();
+        const servers = await proxy.initialize(new LocalCloudProvider());
+        server = servers[0].server;
+        await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+        const port = server.address().port;
+        const tmpPath = path.join("tmp", taskId);
+        fs.mkdirSync(tmpPath);
+        fs.writeFileSync(path.join(tmpPath, "body.json"), JSON.stringify({
+            taskName: "upload-test",
+            options: "[]",
+            expectedImages: 2
+        }));
+
+        const request = (method, urlPath, body, headers, timeoutMs) => {
+            return new Promise((resolve, reject) => {
+                const payload = body === undefined || body === null ? null : Buffer.from(body);
+                const reqHeaders = Object.assign({}, headers || {});
+                if (payload && reqHeaders["Content-Length"] === undefined) reqHeaders["Content-Length"] = payload.length;
+                const req = http.request({
+                    host: "127.0.0.1",
+                    port,
+                    path: urlPath,
+                    method,
+                    headers: reqHeaders
+                }, res => {
+                    const chunks = [];
+                    res.on("data", c => chunks.push(c));
+                    res.on("end", () => {
+                        const raw = Buffer.concat(chunks).toString();
+                        let parsed = raw;
+                        try{ parsed = JSON.parse(raw); }catch(e){}
+                        resolve({statusCode: res.statusCode, body: parsed, raw});
+                    });
+                });
+                req.on("error", reject);
+                req.setTimeout(timeoutMs || 20000, () => req.destroy(new Error(`Timed out waiting for ${method} ${urlPath}`)));
+                if (payload) req.end(payload);
+                else if (method !== "PUT") req.end();
+                else req.end();
+            });
+        };
+
+        const putUrl = (name) => `/task/new/upload/${taskId}/${encodeURIComponent(name)}`;
+
+        const first = await request("PUT", putUrl("img.jpg"), Buffer.from("one"));
+        assert.strictEqual(first.statusCode, 200, JSON.stringify(first.body));
+        assert.strictEqual(first.body.success, true);
+        assert.strictEqual(first.body.size, 3);
+        assert.strictEqual(fs.readFileSync(path.join(tmpPath, "img.jpg"), "utf8"), "one");
+
+        const second = await request("PUT", putUrl("img.jpg"), Buffer.from("two!"));
+        assert.strictEqual(second.statusCode, 200, JSON.stringify(second.body));
+        assert.strictEqual(fs.readFileSync(path.join(tmpPath, "img.jpg"), "utf8"), "two!");
+        assert.deepStrictEqual(fs.readdirSync(tmpPath).filter(f => f !== "body.json").sort(), ["img.jpg"]);
+
+        const mismatch = await new Promise((resolve, reject) => {
+            const net = require("net");
+            const sock = net.connect(port, "127.0.0.1", () => {
+                sock.end(
+                    `PUT ${putUrl("short.jpg")} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabcd`
+                );
+            });
+            const chunks = [];
+            sock.on("data", c => chunks.push(c));
+            sock.on("end", () => resolve(Buffer.concat(chunks).toString()));
+            sock.on("error", reject);
+            sock.setTimeout(5000, () => sock.destroy(new Error("size mismatch did not answer")));
+        });
+        assert.ok(mismatch.indexOf("400") === 0 || mismatch.indexOf("HTTP/1.1 400") !== -1, mismatch);
+        assert.strictEqual(fs.existsSync(path.join(tmpPath, "short.jpg")), false);
+        assert.strictEqual(fs.readdirSync(tmpPath).some(f => f.endsWith(".part")), false);
+
+        await new Promise((resolve, reject) => {
+            const req = http.request({
+                host: "127.0.0.1",
+                port,
+                path: putUrl("half.jpg"),
+                method: "PUT",
+                headers: {"Content-Length": 1000}
+            });
+            req.on("error", () => resolve());
+            req.write(Buffer.alloc(50));
+            req.destroy();
+            setTimeout(resolve, 200);
+        });
+        await new Promise(resolve => setTimeout(resolve, 200));
+        assert.strictEqual(fs.existsSync(path.join(tmpPath, "half.jpg")), false, "aborted upload must not be kept");
+        assert.strictEqual(fs.readdirSync(tmpPath).some(f => f.endsWith(".part")), false, "aborted upload must not leave a .part file");
+
+        const missingLength = await request("PUT", putUrl("nolength.jpg"), null, {"Content-Length": 0});
+        assert.strictEqual(missingLength.statusCode, 400);
+
+        await request("PUT", putUrl("other.jpg"), Buffer.from("yy"));
+        const listed = await request("GET", `/task/new/upload/${taskId}`);
+        assert.strictEqual(listed.statusCode, 200);
+        assert.strictEqual(listed.body.expectedImages, 2);
+        const names = listed.body.files.map(f => f.name).sort();
+        assert.deepStrictEqual(names, ["img.jpg", "other.jpg"]);
+
+        fs.writeFileSync(path.join(tmpPath, "body.json"), JSON.stringify({
+            taskName: "upload-test",
+            options: "[]",
+            expectedImages: 3
+        }));
+        const rejected = await request("POST", `/task/new/commit/${taskId}`);
+        assert.strictEqual(rejected.body.error, "2 of 3 files uploaded", JSON.stringify(rejected.body));
+        assert.strictEqual(fs.existsSync(path.join(tmpPath, "img.jpg")), true, "a rejected partial commit must keep the files");
+
+        const accepted = await request("POST", `/task/new/commit/${taskId}?allowPartial=1`);
+        assert.notStrictEqual(accepted.body.error, "2 of 3 files uploaded");
+        assert.ok(accepted.body.uuid === taskId || accepted.body.error === "No nodes available", JSON.stringify(accepted.body));
+
+        const legacyId = "13131313-1313-4131-8131-131313131313";
+        fs.mkdirSync(path.join("tmp", legacyId));
+        const boundary = "----t";
+        const payload = Buffer.from("jpeg-bytes");
+        const multipart = Buffer.concat([
+            Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="images"; filename="legacy.jpg"\r\nContent-Type: application/octet-stream\r\n\r\n`),
+            payload,
+            Buffer.from(`\r\n--${boundary}--\r\n`)
+        ]);
+        const legacy = await request("POST", `/task/new/upload/${legacyId}`, multipart, {
+            "Content-Type": `multipart/form-data; boundary=${boundary}`,
+            "Content-Length": multipart.length
+        });
+        assert.strictEqual(legacy.statusCode, 200, JSON.stringify(legacy.body));
+        assert.strictEqual(legacy.body.success, true, JSON.stringify(legacy.body));
+        assert.strictEqual(fs.readFileSync(path.join("tmp", legacyId, "legacy.jpg"), "utf8"), "jpeg-bytes");
+
+        const burstId = "14141414-1414-4141-8141-141414141414";
+        fs.mkdirSync(path.join("tmp", burstId));
+        const image = Buffer.alloc(6 * 1024 * 1024, 7);
+        const burstBody = (n) => Buffer.concat([
+            Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="images"; filename="b${n}.jpg"\r\nContent-Type: application/octet-stream\r\n\r\n`),
+            image,
+            Buffer.from(`\r\n--${boundary}--\r\n`)
+        ]);
+        const sendChunked = (n) => new Promise((resolve, reject) => {
+            const body = burstBody(n);
+            const req = http.request({
+                host: "127.0.0.1",
+                port,
+                path: `/task/new/upload/${burstId}`,
+                method: "POST",
+                headers: {
+                    "Content-Type": `multipart/form-data; boundary=${boundary}`,
+                    "Content-Length": body.length
+                }
+            }, res => {
+                res.resume();
+                res.on("end", () => resolve(res.statusCode));
+            });
+            req.on("error", reject);
+            req.setTimeout(20000, () => req.destroy(new Error(`burst ${n} timed out`)));
+            let off = 0;
+            const next = () => {
+                if (off >= body.length){
+                    req.end();
+                    return;
+                }
+                const take = 1 + Math.floor(Math.random() * (64 * 1024));
+                const end = Math.min(body.length, off + take);
+                const ok = req.write(body.subarray(off, end));
+                off = end;
+                if (!ok) req.once("drain", next);
+                else setImmediate(next);
+            };
+            next();
+        });
+        let cursor = 0;
+        const worker = async () => {
+            while (cursor < 30){
+                const n = cursor++;
+                const status = await sendChunked(n);
+                assert.strictEqual(status, 200, `burst file ${n} status ${status}`);
+            }
+        };
+        await Promise.all([worker(), worker(), worker(), worker()]);
+        const saved = fs.readdirSync(path.join("tmp", burstId)).filter(f => f.endsWith(".jpg"));
+        assert.strictEqual(saved.length, 30, `expected 30 files, got ${saved.length}`);
+
+        const idleId = "15151515-1515-4151-8151-151515151515";
+        const idleDir = path.join("tmp", idleId);
+        fs.mkdirSync(idleDir);
+        const idle = await new Promise((resolve, reject) => {
+            const req = http.request({
+                host: "127.0.0.1",
+                port,
+                path: `/task/new/upload/${idleId}/idle.jpg`,
+                method: "PUT",
+                headers: {"Content-Length": 1000000}
+            }, res => {
+                const chunks = [];
+                res.on("data", c => chunks.push(c));
+                res.on("end", () => {
+                    const raw = Buffer.concat(chunks).toString();
+                    let parsed = raw;
+                    try{ parsed = JSON.parse(raw); }catch(e){}
+                    resolve({statusCode: res.statusCode, body: parsed});
+                });
+            });
+            req.on("error", reject);
+            req.setTimeout(40000, () => req.destroy(new Error("idle upload did not fail within 40s")));
+            // Headers have to leave the client or the server never starts the
+            // idle timer, and the keep-alive socket is closed underneath us.
+            req.flushHeaders();
+        });
+        assert.strictEqual(idle.statusCode, 408, JSON.stringify(idle.body));
+        assert.strictEqual(fs.existsSync(path.join(idleDir, "idle.jpg")), false);
+        assert.strictEqual(fs.readdirSync(idleDir).some(f => f.endsWith(".part")), false);
+    }finally{
+        if (server) await new Promise(resolve => server.close(resolve));
+        config.token = originalToken;
+        process.chdir(originalCwd);
+    }
+}
+
 (async function(){
     await testRoutes();
     await testRouteTableDurability();
@@ -1621,6 +1866,7 @@ async function testMachineBreadcrumbIsNameScoped(){
     await testCancelCleanupPreservesWorker();
     await testAbandonedMachineReaper();
     await testMachineBreadcrumbIsNameScoped();
+    await testRawAndMultipartUploads();
     console.log("All tests passed");
 
     // The proxy's housekeeping intervals keep the event loop alive.

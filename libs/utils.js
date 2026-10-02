@@ -181,11 +181,21 @@ module.exports = {
         }
     },
 
+    // In-progress writes and the task record are not images.
+    isUploadSidecar: function(name){
+        const lower = String(name).toLowerCase();
+        return lower === 'body.json' || lower.endsWith('.part');
+    },
+
+    imageFiles: function(files){
+        return (files || []).filter(f => !this.isUploadSidecar(f));
+    },
+
     filesCount: async function(dir){
         return new Promise((resolve, reject) => {
             fs.readdir(dir, (err, files) => {
                 if (err) reject(err);
-                else resolve(files.length);
+                else resolve(files.filter(f => !String(f).toLowerCase().endsWith('.part')).length);
             });
         });
     },
