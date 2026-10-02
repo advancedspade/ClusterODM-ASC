@@ -134,7 +134,7 @@ services:
         condition: service_healthy
     environment:
       GATEWAY_HOSTNAME: ${GATEWAY_HOSTNAME}
-      GATEWAY_HTTP_PROTOCOLS: ${GATEWAY_HTTP_PROTOCOLS:-h1 h2 h3}
+      GATEWAY_HTTP_PROTOCOLS: ${GATEWAY_HTTP_PROTOCOLS:-h1 h2}
     ports:
       - "80:80"
       - "443:443"

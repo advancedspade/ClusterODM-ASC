@@ -65,6 +65,8 @@ Optional secrets: `MAPBOX_ACCESS_TOKEN` (public Mapbox token for the portal
 Leaflet basemap / orthophoto preview; URL-restrict in Mapbox).
 
 Optional vars: `GATEWAY_HOSTNAME`, `OAUTH_ALLOWED_DOMAINS`.
+`GATEWAY_HTTP_PROTOCOLS=h1 h2` is written into the VM `.env` by the deploy
+workflow. UDP 443 is not open, so Caddy does not advertise HTTP/3.
 
 ASR config is committed (ADC only — no HMAC). Prod workflow copies
 `gcp-asr.prod.json` → `gcp-asr.json` before upload. `remote-deploy.sh`

@@ -15,11 +15,12 @@
  *  You should have received a copy of the GNU Affero General Public License
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-const Busboy = require('busboy');
+const busboy = require('busboy');
 const utils = require('./utils');
 const netutils = require('./netutils');
 const path = require('path');
 const fs = require('fs');
+const { Transform } = require('stream');
 const config = require('../config');
 const Curl = require('node-libcurl').Curl;
 const tasktable = require('./tasktable');
@@ -45,23 +46,26 @@ const abortedError = () => Object.assign(new Error("Task was canceled"), {aborte
 // the path is safe to quote.
 const withoutQuery = (url) => String(url).split('?')[0];
 
+const withUniqueSuffix = (filename) => {
+    const parts = filename.split(".");
+    if (parts.length > 1){
+        return `${parts.slice(0, parts.length - 1).join(".")}_.${parts[parts.length - 1]}`;
+    }
+    return filename + "_";
+};
+
+// Sync on purpose: the multipart parser pauses until this stream is read.
+// An await before pipe leaves the socket idle until the inactivity timer
+// destroys it, and Caddy turns that into a 502.
 const assureUniqueFilename = (dstPath, filename) => {
-    return new Promise((resolve, _) => {
-        const dstFile = path.join(dstPath, filename);
-        fs.exists(dstFile, async exists => {
-            if (!exists) resolve(filename);
-            else{
-                const parts = filename.split(".");
-                if (parts.length > 1){
-                    resolve(await assureUniqueFilename(dstPath, 
-                        `${parts.slice(0, parts.length - 1).join(".")}_.${parts[parts.length - 1]}`));
-                }else{
-                    // Filename without extension? Strange..
-                    resolve(await assureUniqueFilename(dstPath, filename + "_"));
-                }
-            }
-        });
-    });
+    let name = filename;
+    const seen = new Set();
+    while (fs.existsSync(path.join(dstPath, name))){
+        if (seen.has(name)) break;
+        seen.add(name);
+        name = withUniqueSuffix(name);
+    }
+    return name;
 };
 
 const getUuid = async (req) => {
@@ -110,8 +114,16 @@ module.exports = {
         if (options.saveFilesToDir === undefined) options.saveFilesToDir = false;
         if (options.parseFields === undefined) options.parseFields = true;
         if (options.limits === undefined) options.limits = {};
-        
-        const busboy = new Busboy({ headers: req.headers });
+
+        const parser = busboy({ headers: req.headers });
+
+        const stages = options.stages || {
+            bytes: 0,
+            reqEnd: false,
+            fileEnd: false,
+            writeFinish: false,
+            parserFinish: false
+        };
 
         const params = {
             options: null,
@@ -123,11 +135,20 @@ module.exports = {
             webhook: "",
             reprocessProject: false,
             fileNames: [],
-            imagesCount: 0
+            imagesCount: 0,
+            stages
         };
 
+        req.on('end', () => { stages.reqEnd = true; });
+        const byteCounter = new Transform({
+            transform(chunk, enc, cb){
+                stages.bytes += chunk.length;
+                cb(null, chunk);
+            }
+        });
+
         if (options.parseFields){
-            busboy.on('field', function(fieldname, val, fieldnameTruncated, valTruncated) {
+            parser.on('field', function(fieldname, val) {
                 // Save options
                 if (fieldname === 'options'){
                     params.options = val;
@@ -161,67 +182,93 @@ module.exports = {
                          (val === 'true' || val === '1')){
                     params.reprocessProject = true;
                 }
-            });
-        }
-        if (options.saveFilesToDir){
-            busboy.on('file', async function(fieldname, file, filename, encoding, mimetype) {
-                if (fieldname === 'images'){
-                    if (options.limits.maxImages && params.imagesCount > options.limits.maxImages){
-                        params.error = "Max images count exceeded.";
-                        file.resume();
-                        return;
-                    }
-                    
-                    filename = utils.sanitize(filename);
-                    
-                    // Special case
-                    if (filename === 'body.json') filename = '_body.json';
 
-                    filename = await assureUniqueFilename(options.saveFilesToDir, filename);
-
-                    const name = path.basename(filename);
-                    params.fileNames.push(name);
-        
-                    const saveTo = path.join(options.saveFilesToDir, name);
-                    let saveStream = null;
-
-                    // Detect if a connection is aborted/interrupted
-                    // and cleanup any open streams to avoid fd leaks
-                    const handleClose = () => {
-                        if (saveStream){
-                            saveStream.close();
-                            saveStream = null;
-                        }
-                        fs.exists(saveTo, exists => {
-                            if (exists){
-                                fs.unlink(saveTo, err => {
-                                    if (err) logger.error(err);
-                                });
-                            }
-                        });
-                    };
-                    req.on('close', handleClose);
-                    req.on('abort', handleClose);
-
-                    file.on('end', () => {
-                        req.removeListener('close', handleClose);
-                        req.removeListener('abort', handleClose);
-                        saveStream = null;
-                        params.imagesCount++;
-                        if (options.limits.maxImages && params.imagesCount > options.limits.maxImages){
-                            params.error = "Max images count exceeded.";
-                        }
-                    });
-
-                    saveStream = fs.createWriteStream(saveTo)
-                    file.pipe(saveStream);
+                else if (fieldname === 'expectedImages' && /^\d+$/.test(String(val))){
+                    params.expectedImages = parseInt(val, 10);
                 }
             });
         }
-        busboy.on('finish', function(){
+        if (options.saveFilesToDir){
+            parser.on('file', function(fieldname, file, info) {
+                const filenameIn = info && info.filename;
+                if (fieldname !== 'images'){
+                    file.resume();
+                    return;
+                }
+                if (options.limits.maxImages && params.imagesCount > options.limits.maxImages){
+                    params.error = "Max images count exceeded.";
+                    file.resume();
+                    return;
+                }
+
+                let filename = utils.sanitize(filenameIn || "");
+
+                // Special case
+                if (filename === 'body.json') filename = '_body.json';
+
+                filename = assureUniqueFilename(options.saveFilesToDir, filename);
+
+                const name = path.basename(filename);
+                params.fileNames.push(name);
+
+                const saveTo = path.join(options.saveFilesToDir, name);
+                let saveStream = null;
+
+                // 'close' also fires once the request body has been fully read.
+                // Only a disconnect before that is an abort; tearing the write
+                // down on a completed body stops the parser from ever answering.
+                const handleClose = () => {
+                    if (req.complete && !req.aborted) return;
+                    if (saveStream){
+                        saveStream.close();
+                        saveStream = null;
+                    }
+                    fs.exists(saveTo, exists => {
+                        if (exists){
+                            fs.unlink(saveTo, err => {
+                                if (err) logger.error(err);
+                            });
+                        }
+                    });
+                };
+                req.on('close', handleClose);
+                req.on('abort', handleClose);
+
+                file.on('end', () => {
+                    stages.fileEnd = true;
+                    req.removeListener('close', handleClose);
+                    req.removeListener('abort', handleClose);
+                    saveStream = null;
+                    params.imagesCount++;
+                    if (options.limits.maxImages && params.imagesCount > options.limits.maxImages){
+                        params.error = "Max images count exceeded.";
+                    }
+                });
+
+                saveStream = fs.createWriteStream(saveTo);
+                saveStream.on('finish', () => { stages.writeFinish = true; });
+                saveStream.on('error', (err) => {
+                    params.error = err.message;
+                    logger.error(err);
+                    file.resume();
+                });
+                file.pipe(saveStream);
+            });
+        }
+        let parserDone = false;
+        const parserFinished = () => {
+            if (parserDone) return;
+            parserDone = true;
+            stages.parserFinish = true;
             onFinish(params);
+        };
+        parser.on('close', parserFinished);
+        parser.on('finish', parserFinished);
+        parser.on('error', (err) => {
+            params.error = err.message;
+            parserFinished();
         });
-        req.pipe(busboy);
+        req.pipe(byteCounter).pipe(parser);
     },
 
     getTaskIdFromPath: function(pathname){
