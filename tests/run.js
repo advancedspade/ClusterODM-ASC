@@ -21,6 +21,8 @@ async function testRoutes(){
     const routes = require("../libs/ascUiRoutes");
     assert.strictEqual(routes.isPublicUiPath("/"), true);
     assert.strictEqual(routes.isPublicUiPath("/login.html"), true);
+    assert.strictEqual(routes.isPublicUiPath("/guide.html"), true);
+    assert.strictEqual(routes.isPublicUiPath("/js/guide.js"), true);
     assert.strictEqual(routes.isPublicUiPath("/auth/google/callback"), true);
     assert.strictEqual(routes.isPublicUiPath("/css/app.css"), true);
     assert.strictEqual(routes.isPublicUiPath("/task/new"), false);
