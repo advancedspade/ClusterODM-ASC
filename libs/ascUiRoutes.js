@@ -5,6 +5,7 @@ const PUBLIC_PAGE_PATHS = new Set([
     "/favicon.ico",
     "/index.html",
     "/login.html",
+    "/guide.html",
     "/home",
     "/uploads",
     "/projects",
